@@ -98,7 +98,7 @@ class Kernels {
   // Fused 32-channel Swin block: one dispatch per block (see fused_block32.comp).
   struct FusedBlock32Args {
     // Pre / post fusion (block 0 / block 70): the input adapter, the post blend and the RGBA head in the block.
-    const Activation* features = nullptr;   // F_PRE: f32 [tokens][16] input features (replaces state / skip16)
+    const Activation* features = nullptr;   // F_PRE: f16 or f32 [tokens][16] input features (replaces state / skip16)
     const vk::Buffer* adapterWeights = nullptr;   // F_PRE: f16 [16][32] (f16Matrix layout 1)
     const Activation* lowRes = nullptr;     // F_POST: half-resolution E4 block output (state = block-0 output)
     const Activation* lowProjection = nullptr;   // F_UPRES: half-resolution f16 projection (state = E4 skip, scaled by inputScale)

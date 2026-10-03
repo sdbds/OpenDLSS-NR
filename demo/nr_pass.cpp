@@ -107,7 +107,7 @@ void NrPass::createSized(uint32_t width, uint32_t height) {
   width_ = width; height_ = height;
   geometry_ = nr::Geometry::fromValid(width, height);
   graph_ = std::make_unique<nr::Graph>(*context_, *model_, *kernels_, geometry_, nr::Graph::Options{});
-  features_ = graph_->allocate("input features", geometry_.fullWidth * geometry_.fullHeight, 16, nr::Format::F32);
+  features_ = graph_->allocate("input features", geometry_.fullWidth * geometry_.fullHeight, 16, nr::Format::F16);
   {
     // a warm-up record + run: the graph allocates its activations (the head among them) at the first record, and
     // the driver compiles / loads every pipeline and CUDA module before the first real frame
@@ -124,21 +124,19 @@ void NrPass::createSized(uint32_t width, uint32_t height) {
   for (Image& h : history_)
     h = createImage(width, height, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                     VK_IMAGE_ASPECT_COLOR_BIT);
-  output_ = createImage(width, height, VK_FORMAT_R8G8B8A8_UNORM,
-                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                        VK_IMAGE_ASPECT_COLOR_BIT);
   {
     // the storage images live in GENERAL for their whole life
     VkCommandBuffer commands = context_->beginCommands();
-    for (Image* image : {&sceneMotion_, &history_[0], &history_[1], &output_})
+    for (Image* image : {&sceneMotion_, &history_[0], &history_[1]})
       transition(commands, *image, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                  VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     VkClearColorValue zero{}; VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    for (Image* image : {&sceneMotion_, &history_[0], &history_[1], &output_})
+    for (Image* image : {&sceneMotion_, &history_[0], &history_[1]})
       vkCmdClearColorImage(commands, image->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
     context_->endAndSubmit(commands, true);
   }
-  color_ = ExternalView{}; velocity_ = ExternalView{};
+  color_ = ExternalView{}; velocity_ = ExternalView{}; target_ = ExternalView{};
+  directOutput_ = false; outputUsage_ = 0;
   for (auto& w : queriesWritten_) w = false;
   framesSinceReset_ = 0;
 }
@@ -147,7 +145,7 @@ void NrPass::destroySized() {
   VK_CHECK(vkDeviceWaitIdle(device_));
   VK_CHECK(vkResetCommandPool(device_, commandPool_, 0));
   for (Image* image : {&sceneMotion_, &history_[0], &history_[1], &output_}) destroyImage(*image);
-  for (ExternalView* external : {&color_, &velocity_}) {
+  for (ExternalView* external : {&color_, &velocity_, &target_}) {
     if (external->view) vkDestroyImageView(device_, external->view, nullptr);
     *external = ExternalView{};
   }
@@ -277,7 +275,7 @@ void NrPass::updateComputeSets() {
       const nr::Activation& head = graph_->head();
       VkDescriptorBufferInfo buffer{k == 0 ? features_->buffer.buffer : head.buffer.buffer, 0, VK_WHOLE_SIZE};
       VkDescriptorBufferInfo params{params_[h].buffer, 0, sizeof(ParamsBlock)};
-      VkDescriptorImageInfo out{VK_NULL_HANDLE, output_.view, VK_IMAGE_LAYOUT_GENERAL};
+      VkDescriptorImageInfo out{VK_NULL_HANDLE, directOutput_ ? target_.view : output_.view, VK_IMAGE_LAYOUT_GENERAL};
       VkDescriptorImageInfo next{VK_NULL_HANDLE, history_[1 - h].view, VK_IMAGE_LAYOUT_GENERAL};
       VkWriteDescriptorSet writes[7]{};
       for (int i = 0; i < 7; ++i) { writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[i].dstSet = computeSets_[h][k]; writes[i].dstBinding = i; writes[i].descriptorCount = 1; }
@@ -316,7 +314,8 @@ NrPass::Frame NrPass::beginFrame(const NrControls& controls, const float backgro
       timings_.preprocessMs = ms(kPreprocessEnd) - ms(kSceneEnd);
       timings_.networkMs = ms(kNetworkEnd) - ms(kPreprocessEnd);
       timings_.compositeMs = ms(kCompositeEnd) - ms(kNetworkEnd);
-      timings_.presentMs = ms(kPresentEnd) - ms(kCompositeEnd);
+      timings_.outputMs = ms(kOutputReady) - ms(kCompositeEnd);
+      timings_.presentMs = ms(kPresentEnd) - ms(kOutputReady);
       timings_.frameMs = ms(kPresentEnd) - ms(kFrameStart);
     }
   }
@@ -383,10 +382,10 @@ void NrPass::buildComputeCommands() {
       vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, compositePipeline_);
       vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, computeLayout_, 0, 1, &computeSets_[h][1], 0, nullptr);
       vkCmdDispatch(commands, (width_ + 7) / 8, (height_ + 7) / 8, 1);
-      // output: compute write -> the copy to the renderer's texture; next history: compute write -> next frame's reads
+      // History publication; record() handles the output image's copy or direct-write transition.
       VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-      memory.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; memory.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
-      vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      memory.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; memory.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                            0, 1, &memory, 0, nullptr, 0, nullptr);
       writeStamp(commands, h, kCompositeEnd);
       VK_CHECK(vkEndCommandBuffer(commands));
@@ -397,10 +396,30 @@ void NrPass::buildComputeCommands() {
 void NrPass::record(void* commandBuffer, const Frame& frame, const GpuImage& color, const GpuImage& velocity, const GpuImage& output) {
   VkCommandBuffer commands = (VkCommandBuffer)commandBuffer;
   const uint32_t h = frame.parity;
+  if (!output.image || output.format != VK_FORMAT_R8G8B8A8_UNORM || output.width != width_ || output.height != height_)
+    throw std::runtime_error("NR output must be an rgba8 image matching the pass dimensions");
+  const bool direct = (output.usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
+  if (!direct && output.usage && !(output.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+    throw std::runtime_error("NR output needs STORAGE or TRANSFER_DST usage");
   // views onto the renderer's images; when they changed (first frame, resize) the descriptor sets and the
   // pre-recorded command buffers that reference them are rebuilt (nothing of them is pending then)
   bool changed = bindExternal(color_, color);
   changed = bindExternal(velocity_, velocity) || changed;
+  changed = (direct != directOutput_) || changed;
+  if (direct) {
+    changed = bindExternal(target_, output) || changed;
+  } else {
+    // The copy route must not retain a view onto a renderer target it no longer binds.
+    if (target_.view) vkDestroyImageView(device_, target_.view, nullptr);
+    target_ = ExternalView{};
+    if (!output_.image) {
+      output_ = createImage(width_, height_, VK_FORMAT_R8G8B8A8_UNORM,
+                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+      changed = true;
+    }
+  }
+  directOutput_ = direct;
+  outputUsage_ = output.usage;
   if (changed) {
     updateComputeSets();
     buildComputeCommands();
@@ -416,6 +435,13 @@ void NrPass::record(void* commandBuffer, const Frame& frame, const GpuImage& col
   barrier(commands, velocity_.image, (VkImageLayout)velocity.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
           VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
   writeStamp(commands, h, kSceneEnd);
+  if (directOutput_) {
+    barrier(commands, target_.image, (VkImageLayout)output.layout, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+  } else if (output_.layout != VK_IMAGE_LAYOUT_GENERAL) {
+    transition(commands, output_, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+  }
   // motion vectors: (id, depth, motion bits) -> rgba16f: current -> previous in uv units, and whether it is on screen
   vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, unpackPipeline_);
   vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, unpackLayout_, 0, 1, &unpackSet_, 0, nullptr);
@@ -430,7 +456,15 @@ void NrPass::record(void* commandBuffer, const Frame& frame, const GpuImage& col
   vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &motionBarrier, 0, nullptr, 0, nullptr);
   // preprocess -> network -> composite (pre-recorded)
   vkCmdExecuteCommands(commands, 1, &computeCommands_[h][frame.enabled ? 1 : 0]);
-  // the composited output -> the renderer's texture (sampled by its present view)
+  // Publish the composited target for the renderer's present view.
+  if (directOutput_) {
+    barrier(commands, target_.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+    writeStamp(commands, h, kOutputReady);
+    return;
+  }
+  // Legacy/non-storage targets keep the copy route.
   VkImage target = (VkImage)(uintptr_t)output.image;
   barrier(commands, target, (VkImageLayout)output.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
           VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -445,6 +479,7 @@ void NrPass::record(void* commandBuffer, const Frame& frame, const GpuImage& col
           VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
   barrier(commands, output_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
           VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+  writeStamp(commands, h, kOutputReady);
 }
 
 std::vector<uint8_t> NrPass::readImage(VkImage image, uint32_t bytesPerPixel, VkImageLayout layout) {
@@ -467,8 +502,12 @@ std::vector<uint8_t> NrPass::readImage(VkImage image, uint32_t bytesPerPixel, Vk
 
 void NrPass::saveOutput(const std::string& path, bool sceneInstead) {
   if (sceneInstead && !color_.image) return;
+  if (!sceneInstead && !(directOutput_ ? target_.image : output_.image)) return;
+  if (!sceneInstead && directOutput_ && !(outputUsage_ & VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+    throw std::runtime_error("capturing a direct NR output requires TRANSFER_SRC usage");
   std::vector<uint8_t> bytes = sceneInstead ? readImage(color_.image, 8, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-                                            : readImage(output_.image, 4, VK_IMAGE_LAYOUT_GENERAL);
+      : directOutput_ ? readImage(target_.image, 4, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                      : readImage(output_.image, 4, VK_IMAGE_LAYOUT_GENERAL);
   std::ofstream file(path, std::ios::binary);
   file << "P6\n" << width_ << " " << height_ << "\n255\n";
   std::vector<uint8_t> row(width_ * 3);

@@ -1,6 +1,6 @@
 #version 460
 // DLSS-NR input features from the scene color, the reprojected neural history and the controls
-// f32 [fullHeight][fullWidth][16].
+// f16 [fullHeight][fullWidth][16], rounded at storage instead of in block 0.
 #extension GL_GOOGLE_include_directive : require
 #include "nr_common.glsl"
 
@@ -9,7 +9,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D sceneColor;      // rgba16f, linear HDR (top-down rows)
 layout(set = 0, binding = 1) uniform sampler2D historyPrev;     // rgba16f neural half surface (linear sampler)
 layout(set = 0, binding = 2) uniform sampler2D motionTex;       // rg16f: current -> previous, uv units
-layout(std430, set = 0, binding = 3) writeonly buffer Features { vec4 features[]; };   // 4 x vec4 per pixel (coalesced 16 B stores)
+layout(std430, set = 0, binding = 3) writeonly buffer Features { uvec4 features[]; };  // 2 x uvec4 per pixel (packed halves)
 layout(std140, set = 0, binding = 4) uniform Params { NrParams params; };
 
 float hashUniform(uint value) {
@@ -50,8 +50,6 @@ void main() {
                        roundF16(roundF16(roundF16(proxy.g) - 0.5) * 0.125),
                        roundF16(roundF16(roundF16(proxy.b) - 0.5) * 0.125));
   vec3 noise = gaussian3(id.x, id.y, params.seed);
-  uint base = (id.y * params.fullWidth + id.x) * 4u;
-  features[base + 0u] = vec4(noise, 1.0);
   // lanes 7-9: the reprojected previous output, centred like the proxy; without a history (a reset, or a surface the
   // previous frame did not show) the current proxy stands in, as on the first frame
   vec3 history = centered;
@@ -60,9 +58,12 @@ void main() {
     history = vec3(roundF16(roundF16(roundF16(h.r) - 0.5) * 0.125), roundF16(roundF16(roundF16(h.g) - 0.5) * 0.125),
                    roundF16(roundF16(roundF16(h.b) - 0.5) * 0.125));
   }
-  features[base + 1u] = vec4(centered, history.r);
-  features[base + 2u] = vec4(history.g, history.b, params.style / 128.0, roundF16(params.localTone));
-  features[base + 3u] = vec4(roundF16(params.autoMask > 0.0 ? 1.0 : params.localStructure),
-                             roundF16(params.autoMask > 0.0 ? (params.skinStructure < 0.0 ? params.localStructure : params.skinStructure) : -1.0),
-                             roundF16(params.autoMask > 0.0 ? params.localStructure : -1.0), 0.0);
+  vec4 controls = vec4(roundF16(params.autoMask > 0.0 ? 1.0 : params.localStructure),
+                       roundF16(params.autoMask > 0.0 ? (params.skinStructure < 0.0 ? params.localStructure : params.skinStructure) : -1.0),
+                       roundF16(params.autoMask > 0.0 ? params.localStructure : -1.0), 0.0);
+  uint base = (id.y * params.fullWidth + id.x) * 2u;
+  features[base] = uvec4(packHalf2x16(noise.xy), packHalf2x16(vec2(noise.z, 1.0)),
+                         packHalf2x16(centered.xy), packHalf2x16(vec2(centered.z, history.r)));
+  features[base + 1u] = uvec4(packHalf2x16(history.gb), packHalf2x16(vec2(params.style / 128.0, roundF16(params.localTone))),
+                              packHalf2x16(controls.xy), packHalf2x16(controls.zw));
 }

@@ -238,12 +238,13 @@ Graph::Temporaries Graph::createTemporaries(const std::string& label, uint32_t r
 
 Graph::SplitTemporaries Graph::createSplitTemporaries(const std::string& label, uint32_t rows) {
   SplitTemporaries t;
+  const bool fused = options_.fusedBlocks && !options_.captureIntermediates;
   t.branch = allocate(label + " split branch", rows, 512, Format::E4);
-  t.middle = allocate(label + " split middle", rows, 2048, Format::E4);
+  if (!fused) t.middle = allocate(label + " split middle", rows, 2048, Format::E4);
   t.layer0 = allocate(label + " split layer0", rows, 512, Format::E4);
   t.ffnResidual = allocate(label + " split residual", rows, 512, Format::E4);
-  t.qkv = allocate(label + " split QKV", rows, 1536, Format::F16);
-  t.normalized = allocate(label + " split normalized", rows, 1536, Format::E4);
+  if (!fused) t.qkv = allocate(label + " split QKV", rows, 1536, Format::F16);
+  if (!fused) t.normalized = allocate(label + " split normalized", rows, 1536, Format::E4);
   t.attended = allocate(label + " split attended", rows, 512, Format::E4);
   return t;
 }
@@ -672,8 +673,9 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
   kernels_.resetSync(commands);   // chaining and split-K tile counters
   const Geometry& g = geometry_;
   const uint32_t fullRows = g.fullWidth * g.fullHeight;
-  if (inputFeatures.format != Format::F32 || inputFeatures.rows != fullRows || inputFeatures.channels != 16)
-    throw std::runtime_error("input features must be f32 [fullWidth*fullHeight][16]");
+  if ((inputFeatures.format != Format::F32 && inputFeatures.format != Format::F16) ||
+      inputFeatures.rows != fullRows || inputFeatures.channels != 16)
+    throw std::runtime_error("input features must be f16 or f32 [fullWidth*fullHeight][16]");
   boundaries_.clear();
   usedThisRecord_.clear();
   for (uint32_t& phase : windowPhase_) phase = 0;
@@ -685,12 +687,14 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
   FusedLayout preLayout = preFusedLayout();
   if (preTensor.byteLength != preLayout.endWithoutPadding + 16) throw std::runtime_error("unexpected block0 layout");
   const bool fusePre = routes_.fusePre, fusePool = routes_.fusePool;
+  const bool preInBlock = options_.fusedBlocks && !options_.captureIntermediates && fusePre;
+  const bool poolBlock0 = preInBlock && fusePool;
   Activation* adapter = allocate("retained full block0", fullRows, 32, Format::E4);
   Activation* resized = allocate("block0 downsample", g.levels[0].width * g.levels[0].height, 32, Format::E4);
-  Activation* adapterRaw = allocate("raw FP16 block0", fullRows, 32, Format::F16);
+  Activation* adapterRaw = poolBlock0 ? nullptr : allocate("raw FP16 block0", fullRows, 32, Format::F16);
   Temporaries fullTemps = createTemporaries("pre block0", fullRows, 32);
-  if (options_.fusedBlocks && !options_.captureIntermediates && fusePre) {
-    // The f32 -> f16 conversion and the 16 -> 32 input adapter run inside block 0 (register-resident skip / state).
+  if (preInBlock) {
+    // The input adapter runs inside block 0; F16 input already has the F32 path's conversion applied.
     uint32_t paddedN = 0;
     const vk::Buffer& adapterWeights = model_.f16Matrix(preTensor, preLayout.inputAdapter, 16, 32, paddedN);
     uint32_t shiftX, shiftY;
@@ -719,14 +723,18 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
     chainBlock32(f, 0, 0, fusePool);   // block 1 reads the pooled rows
     kernels_.fusedBlock32(commands, f);
   } else {
-    inputHalf_ = allocate("input features f16", fullRows, 16, Format::F16);
-    kernels_.convertF32ToF16(commands, inputFeatures, *inputHalf_);
+    const Activation* inputHalf = &inputFeatures;
+    if (inputFeatures.format == Format::F32) {
+      inputHalf_ = allocate("input features f16", fullRows, 16, Format::F16);
+      kernels_.convertF32ToF16(commands, inputFeatures, *inputHalf_);
+      inputHalf = inputHalf_;
+    }
     Activation* projectedFp16 = allocate("full FP16 input adapter", fullRows, 32, Format::F16);
     Activation* projected = allocate("full FP8 input adapter", fullRows, 32, Format::E4);
     {
       uint32_t paddedN = 0;
       GemmF16Args pre;
-      pre.input = inputHalf_;
+      pre.input = inputHalf;
       pre.weights = &model_.f16Matrix(preTensor, preLayout.inputAdapter, 16, 32, paddedN);
       pre.paddedN = paddedN; pre.output = projectedFp16; pre.dualOutput = projected;
       pre.rows = fullRows; pre.K = 16; pre.N = 32;
@@ -746,17 +754,17 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
                         d5 = g.levels[5];
   const uint32_t rows0 = d0.width * d0.height;
   kernels_.setStageLabel("transition 0-1");
-  if (!(options_.fusedBlocks && !options_.captureIntermediates && fusePre && fusePool))
+  if (!poolBlock0)
     kernels_.downsample2x(commands, *adapterRaw, *resized, g.fullWidth, g.fullHeight, d0.width, d0.height);
   capture(commands, "transition-0-1", *resized);
 
   Activation* state = resized;
   Activation* scratch = allocate("encoder 32 state", rows0, 32, Format::E4);
-  Activation* transitionRaw32 = allocate("raw FP16 block4", rows0, 32, Format::F16);
+  const bool poolBlock4 = options_.fusedBlocks && !options_.captureIntermediates && fusePool;
+  Activation* transitionRaw32 = poolBlock4 ? nullptr : allocate("raw FP16 block4", rows0, 32, Format::F16);
   Temporaries latentTemps = createTemporaries("encoder 32", rows0, 32);
   const uint32_t rows1 = d1.width * d1.height;
   Activation* downsampled32 = allocate("encoder 32 downsample", rows1, 32, Format::E4);
-  const bool poolBlock4 = options_.fusedBlocks && !options_.captureIntermediates && fusePool;
   for (int block = 1; block <= 4; ++block) {
     encodeFusedBlock(commands, latentTemps, *state, scratch, block, 32, d0.width, d0.height, takeWindowPhase(0),
                      fusedLayout(32), model_.tensor(block), nullptr, (block == 4 && !poolBlock4) ? transitionRaw32 : nullptr,
@@ -894,8 +902,9 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
     p.Nmatrix = stage.channels; p.output = projection; p.quantize = false;
     kernels_.gemmFp8(commands, p);
     Activation* merged = allocate(label + " skip merge", rows, stage.channels, Format::E4);
-    Activation* rawMerged = stage.channels == 32 ? allocate(label + " raw skip merge", rows, 32, Format::F16) : nullptr;
     const bool upresInBlock = stage.channels == 32 && options_.fusedBlocks && !options_.captureIntermediates && routes_.fuseUpres;
+    Activation* rawMerged = stage.channels == 32 && !upresInBlock
+                                ? allocate(label + " raw skip merge", rows, 32, Format::F16) : nullptr;
     if (!upresInBlock)
       kernels_.upsampleResidual(commands, *projection, *stage.skip, transition, layout.transitionScale, *merged,
                                 rawMerged, stage.low.width, stage.low.height, stage.high.width, stage.high.height);

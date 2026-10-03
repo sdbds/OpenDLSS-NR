@@ -220,7 +220,7 @@ struct FrameTextures {
     velocityDepth = Texture::Builder().width(w).height(h).format(Texture::InternalFormat::DEPTH32F)
         .usage(Texture::Usage::DEPTH_ATTACHMENT | Texture::Usage::SAMPLEABLE).build(engine);
     output = Texture::Builder().width(w).height(h).format(Texture::InternalFormat::RGBA8)
-        .usage(Texture::Usage::SAMPLEABLE | Texture::Usage::BLIT_DST).build(engine);
+        .usage(Texture::Usage::SAMPLEABLE | Texture::Usage::BLIT_DST | Texture::Usage::BLIT_SRC | Texture::Usage::STORAGE).build(engine);
     target = RenderTarget::Builder().texture(RenderTarget::AttachmentPoint::COLOR, color).texture(RenderTarget::AttachmentPoint::DEPTH, depth).build(engine);
   }
   void destroy(Engine& engine) {
@@ -602,6 +602,7 @@ int main(int argc, char** argv) {
         ImGui::Text("preprocess  %6.3f", t.preprocessMs);
         ImGui::Text("network     %6.3f", t.networkMs);
         ImGui::Text("composite   %6.3f", t.compositeMs);
+        ImGui::Text("output      %6.3f", t.outputMs);
         ImGui::Text("present+ui  %6.3f", t.presentMs);
         ImGui::Text("frame       %6.3f", t.frameMs);
         ImGui::Text("%ux%u, frame %u", nr->width(), nr->height(), nr->frameCount());
@@ -684,8 +685,8 @@ int main(int argc, char** argv) {
   engine->flushAndWait();
   {
     const NrTimings& t = nr->timings();
-    fprintf(stderr, "[demo] %u frames at %ux%u, last GPU timings (ms): scene %.3f preprocess %.3f network %.3f composite %.3f present+ui %.3f frame %.3f; %.1f fps\n",
-            frameIndex, width, height, t.sceneMs, t.preprocessMs, t.networkMs, t.compositeMs, t.presentMs, t.frameMs, fpsValue);
+    fprintf(stderr, "[demo] %u frames at %ux%u, last GPU timings (ms): scene %.3f preprocess %.3f network %.3f composite %.3f output %.3f present+ui %.3f frame %.3f; %.1f fps\n",
+            frameIndex, width, height, t.sceneMs, t.preprocessMs, t.networkMs, t.compositeMs, t.outputMs, t.presentMs, t.frameMs, fpsValue);
   }
   nr.reset();
   loaded.reset();

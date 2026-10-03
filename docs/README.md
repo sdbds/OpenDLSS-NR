@@ -22,6 +22,8 @@ spaces are, which invariants the code relies on, and which parts of the design a
   fallback behaviour, the performance-critical paths.
 * [frame.md](frame.md) is the demo's frame: rendered image to input features, the head to pixels, motion
   vectors, and the temporal loop (what carries between frames).
+* [optimization-validation.md](optimization-validation.md) records path-dependent allocation, FP16 input
+  storage and direct composition, including compatibility requirements and measured validation results.
 
 ## One page
 
@@ -35,7 +37,7 @@ reprojected history by `sigmoid(logit)`. It is a generative neural renderer, not
 output are the same resolution.
 
 ```
- proxy + noise + history (16 f32)                                              RGBA f32
+ proxy + noise + history (16 f16/f32)                                          RGBA f32
               |                                                                    ^
         [block 0, 32ch, full res] ------------------------ skip ----------> [block 70, 32ch] -> head
               | 2x2 pool                                                            ^ 2x upsample

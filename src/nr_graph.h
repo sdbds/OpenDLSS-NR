@@ -47,7 +47,8 @@ class Graph {
   Graph(vk::Context& context, Model& model, Kernels& kernels, const Geometry& geometry, Options options);
   ~Graph();
 
-  // Record the complete network. `inputFeatures` is f32 [fullWidth*fullHeight][16].
+  // Record the complete network. `inputFeatures` is f16 or f32 [fullWidth*fullHeight][16].
+  // F32 is rounded to F16 before the input projection; F16 preserves that already-rounded input.
   void record(VkCommandBuffer commands, const Activation& inputFeatures);
 
   const Activation& head() const { return *head_; }  // f32 [full rows][4]

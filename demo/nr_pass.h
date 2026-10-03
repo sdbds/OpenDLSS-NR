@@ -1,7 +1,7 @@
 // DLSS-NR inside the renderer's frame: the renderer (Filament) draws the scene into an HDR color texture and
 // writes per-object motion vectors; this pass, recorded into the renderer's own command buffer between its passes,
 // unpacks the motion vectors, runs the feature preprocess, the NR graph (src/) and the temporal composite with the
-// neural history, and copies the rgba8 result into the renderer's output texture, which its present view draws.
+// neural history, writing directly to a storage-capable rgba8 renderer target (copy fallback otherwise).
 // Runs on the renderer's device (vk::Context adopts it). The NR work is pre-recorded once per history parity and
 // NR on/off in secondary command buffers.
 #pragma once
@@ -30,7 +30,7 @@ struct NrControls {
 };
 
 struct NrTimings {
-  double sceneMs = 0, preprocessMs = 0, networkMs = 0, compositeMs = 0, presentMs = 0, frameMs = 0;
+  double sceneMs = 0, preprocessMs = 0, networkMs = 0, compositeMs = 0, outputMs = 0, presentMs = 0, frameMs = 0;
 };
 
 class NrPass {
@@ -69,11 +69,13 @@ class NrPass {
 
   // The renderer's thread, inside its command buffer, outside of any render pass. `color` (rgba16f) and `velocity`
   // (rgba32ui: id, depth bits, motion x/y bits) are the renderer's textures as it left them; `output` (rgba8) is
-  // the texture the renderer's present view samples. Stamps kSceneEnd .. kCompositeEnd. The images are left in
+  // the texture the renderer's present view samples. STORAGE usage opts into direct writes; unknown usage keeps
+  // the copy route. Images bound by pre-recorded commands may change only after earlier work is complete.
+  // Stamps kSceneEnd .. kOutputReady. The images are left in
   // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL (the value of shaderReadOnlyLayout()) for the renderer's tracking.
   void record(void* commandBuffer, const Frame& frame, const GpuImage& color, const GpuImage& velocity, const GpuImage& output);
   // timestamps around the renderer's own passes, recorded the same way (kFrameStart resets the frame's queries)
-  enum Stamp { kFrameStart = 0, kSceneEnd = 1, kPreprocessEnd = 2, kNetworkEnd = 3, kCompositeEnd = 4, kPresentEnd = 5, kStampCount = 6 };
+  enum Stamp { kFrameStart = 0, kSceneEnd = 1, kPreprocessEnd = 2, kNetworkEnd = 3, kCompositeEnd = 4, kOutputReady = 5, kPresentEnd = 6, kStampCount = 7 };
   void recordStamp(void* commandBuffer, const Frame& frame, Stamp stamp);
   static uint32_t shaderReadOnlyLayout();
 
@@ -121,8 +123,10 @@ class NrPass {
   uint32_t width_ = 0, height_ = 0;
   float blendScale_ = 1.0f;
 
-  Image sceneMotion_, history_[2], output_;
-  ExternalView color_, velocity_;
+  Image sceneMotion_, history_[2], output_;  // output_ is allocated lazily for the copy fallback only
+  ExternalView color_, velocity_, target_;
+  bool directOutput_ = false;
+  uint32_t outputUsage_ = 0;
   VkSampler linearSampler_ = VK_NULL_HANDLE, nearestSampler_ = VK_NULL_HANDLE;
   vk::Buffer params_[2];
   struct ParamsBlock;

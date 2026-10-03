@@ -37,6 +37,7 @@ void queueGpuWork(filament::Engine& engine, const std::vector<filament::Texture*
       images[i].layout = (uint32_t)texture.layout;
       images[i].width = texture.width;
       images[i].height = texture.height;
+      images[i].usage = texture.usage;
     }
     work((void*)context.getCommandBuffer(), images);
     for (size_t i = 0; i < handles.size(); ++i) context.setTextureLayout(handles[i], (VkImageLayout)images[i].layout);

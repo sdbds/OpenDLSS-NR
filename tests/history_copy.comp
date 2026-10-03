@@ -1,0 +1,11 @@
+#version 460
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D history;
+layout(std430, binding = 1) writeonly buffer Result { uvec2 packed[]; };
+layout(push_constant) uniform Push { uint width, height; } pc;
+void main() {
+  uvec2 p = gl_GlobalInvocationID.xy;
+  if (p.x >= pc.width || p.y >= pc.height) return;
+  vec4 h = texelFetch(history, ivec2(p), 0);
+  packed[p.y * pc.width + p.x] = uvec2(packHalf2x16(h.xy), packHalf2x16(h.zw));
+}

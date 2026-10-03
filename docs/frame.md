@@ -1,6 +1,6 @@
 # The frame: from a rendered image to pixels
 
-The network takes 16 f32 lanes per padded pixel and returns 4. Everything around that (building the lanes,
+The network takes 16 f16 or f32 lanes per padded pixel and returns 4 f32 lanes. Everything around that (building the lanes,
 turning the head into an image, and the temporal loop) is the *pipeline*, and it is as much a part of matching
 NVIDIA's output as the network is. `demo/` implements it; `demo/README.md` covers building and driving the demo,
 this file covers what it computes and why.
@@ -13,7 +13,7 @@ this file covers what it computes and why.
  motion rgba16f (xy: current -> previous, uv units, y down; z: 1 if that previous position
       |          is on screen, i.e. there is a history, else 0)
       v  nr_preprocess.comp
- features f32 [field][16]  ---->  the network (src/)  ---->  head f32 [field][4]
+ features f16 [field][16]  ---->  the network (src/)  ---->  head f32 [field][4]
       |                                                          |
       +---------------------------- nr_composite.comp <----------+
                                           |
@@ -26,6 +26,13 @@ The NR work is recorded **into Filament's own command buffer**, between the scen
 through a patched `Engine::queueVulkanCommand` hook. No extra submissions, no host synchronization, and the
 renderer's own resource tracking stays valid because the pass leaves every image in
 `SHADER_READ_ONLY_OPTIMAL`.
+
+The demo stores features as f16, moving the original block-0 conversion to the
+preprocess store; F32 graph callers remain supported. Composite writes directly
+to the renderer's storage-capable RGBA8 target and independently updates history.
+Unknown or non-storage target usage retains the copy route. See
+[optimization-validation.md](optimization-validation.md) for the integration
+contract, allocation measurements and regression checks.
 
 ## The proxy
 

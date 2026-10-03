@@ -625,7 +625,8 @@ void Kernels::fusedBlock32Ptx(VkCommandBuffer commands, const FusedBlock32Args& 
   check(a.w1Ptx && a.w2Ptx, "PTX fused block needs the permuted / tiled weights");
   check(!a.skip16 && !a.outF16, "PTX fused block: f16 skip / raw output variants are not generated");
   uint32_t flags = (a.outE4 ? 2u : 0u) | (a.features ? 8u : 0u) | (a.lowRes ? 16u : 0u) | (a.head ? 32u : 0u) |
-                   (a.pooled ? 64u : 0u) | (a.lowProjection ? 128u : 0u);
+                   (a.pooled ? 64u : 0u) | (a.lowProjection ? 128u : 0u) |
+                   (a.features && a.features->format == Format::F16 ? 256u : 0u);
   const std::string entry = "block32_e4m3_f" + std::to_string(flags);
   PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);
   uint32_t windowsX = (a.width + a.shiftX + 7) / 8, windowsY = (a.height + a.shiftY + 7) / 8;
@@ -661,6 +662,8 @@ bool Kernels::fusedBlock32IsPtx(const FusedBlock32Args& a) {
 }
 
 void Kernels::fusedBlock32(VkCommandBuffer commands, const FusedBlock32Args& a) {
+  check(!a.features || ((a.features->format == Format::F32 || a.features->format == Format::F16) &&
+        a.features->channels == 16 && a.features->rows == a.width * a.height && a.adapterWeights), "fused pre inputs");
   if (fusedBlock32IsPtx(a)) { fusedBlock32Ptx(commands, a); return; }
   check(!a.chainWait && !a.chainSignal && !a.chained, "the GLSL fused block does not implement counter chaining");
   check(a.features || (a.state && a.state->format == Format::E4 && a.state->channels == 32), "fused block state");
@@ -671,7 +674,8 @@ void Kernels::fusedBlock32(VkCommandBuffer commands, const FusedBlock32Args& a) 
   check(!a.outF16 || (a.outF16->format == Format::F16 && a.outF16->channels == 32), "fused block f16 output");
   check(a.ffnScaleByteOffset % 16 == 0 && a.attnScaleByteOffset % 16 == 0, "fused block scale vectors must be 16-byte aligned");
   uint32_t flags = (a.skip16 ? 1u : 0u) | (a.outE4 ? 2u : 0u) | (a.outF16 ? 4u : 0u) | (a.features ? 8u : 0u) |
-                   (a.lowRes ? 16u : 0u) | (a.head ? 32u : 0u) | (a.pooled ? 64u : 0u) | (a.lowProjection ? 128u : 0u);
+                   (a.lowRes ? 16u : 0u) | (a.head ? 32u : 0u) | (a.pooled ? 64u : 0u) | (a.lowProjection ? 128u : 0u) |
+                   (a.features && a.features->format == Format::F16 ? 256u : 0u);
   vk::SpecConstants constants;
   constants.add(0, flags);
   uint32_t windowsX = (a.width + a.shiftX + 7) / 8, windowsY = (a.height + a.shiftY + 7) / 8;
@@ -693,7 +697,7 @@ void Kernels::fusedBlock32(VkCommandBuffer commands, const FusedBlock32Args& a) 
   bindings[7] = a.prior;
   if (a.outE4) bindings[8] = &a.outE4->buffer;
   if (a.outF16) bindings[9] = &a.outF16->buffer;
-  if (a.features) { check(a.features->format == Format::F32 && a.features->channels == 16 && a.adapterWeights, "fused pre inputs"); bindings[0] = &a.features->buffer; bindings[11] = a.adapterWeights; }
+  if (a.features) { bindings[0] = &a.features->buffer; bindings[11] = a.adapterWeights; }
   if (a.lowRes) { check(a.lowRes->format == Format::E4 && a.state && a.state->format == Format::E4, "fused post inputs"); bindings[1] = &a.lowRes->buffer; }
   if (a.lowProjection) { check(a.lowProjection->format == Format::F16 && a.lowProjection->channels == 32 && a.state && !a.lowRes && !a.skip16, "fused upres inputs"); bindings[1] = &a.lowProjection->buffer; }
   if (a.head) { check(a.head->format == Format::F32 && a.head->channels == 4 && a.headWeights, "fused head"); bindings[9] = &a.head->buffer; bindings[11] = a.headWeights; }

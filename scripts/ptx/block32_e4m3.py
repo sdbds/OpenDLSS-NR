@@ -7,17 +7,18 @@ projections, cosine normalization, K rows / transposed V into shared memory (phy
 prior, the specified softmax, P V, projection + ffn * attnScale, E4 output. Every arithmetic step is that of the
 GLSL kernel (same instructions on the same fragment elements); only the data movement differs.
 
-Variants (flags): PRE (block 0: f32 features x f16 adapter in the input path), POST (block 70: learned post
+Variants (flags): PRE (block 0: f32 features, or f16 with PRE_F16, x f16 adapter), POST (block 70: learned post
 blend of block-0 E4 and the 2x upsampled half-res E4), UPRES (block 66: f16 low-res projection + E4 skip *
 scale), HEAD (RGBA head from the f16 result), POOL (2x2 box pool of the f16 result to E4), OUT_E4.
 
-python block32_e4m3.py <flags> out.ptx      flags: sum of E4=2 PRE=8 POST=16 HEAD=32 POOL=64 UPRES=128
+python block32_e4m3.py <flags> out.ptx      flags: sum of E4=2 PRE=8 POST=16 HEAD=32 POOL=64 UPRES=128 PRE_F16=256
 """
 import sys
 from ptxgen import Ptx
 from swin import *
 
 F_OUT_E4, F_PRE, F_POST, F_HEAD, F_POOL, F_UPRES = 2, 8, 16, 32, 64, 128
+F_PRE_F16 = 256
 
 # shared memory map (bytes)
 W1S, W2S, WQKVS, WPROJS = 0, 4096, 8192, 11264
@@ -32,6 +33,8 @@ A2A_SMEM = 0      # accumulator -> A fragment through the per-warp staging tile 
 
 def generate(flags, max_regs=None):
     pre, post, upres = bool(flags & F_PRE), bool(flags & F_POST), bool(flags & F_UPRES)
+    pre_half = bool(flags & F_PRE_F16)
+    assert not pre_half or pre
     head, pool, outE4 = bool(flags & F_HEAD), bool(flags & F_POOL), bool(flags & F_OUT_E4)
     assert pre + post + upres <= 1
     name = f"block32_e4m3_f{flags}"
@@ -214,6 +217,9 @@ def generate(flags, max_regs=None):
     def issue_loads(gm, pred):
         pixel = gm["pixel"]
         if pre:
+            if pre_half:
+                # Already-rounded features [tokens][16] f16: this lane's eight halves in one 16 B load.
+                return load_v4(P["pState"], p.add32(p.shl32(pixel, 5), p.shl32(ldPart, 4)), pred, False)
             # features [tokens][16] f32: 64 B per token, this lane's 8 floats at part * 32
             return (load_v4(P["pState"], p.add32(p.shl32(pixel, 6), p.shl32(ldPart, 5)), pred, False) +
                     load_v4(P["pState"], p.add32(p.add32(p.shl32(pixel, 6), p.shl32(ldPart, 5)), p.imm32(16)), pred, False))
@@ -266,10 +272,13 @@ def generate(flags, max_regs=None):
     # ---- Phase F inputs: x (E4 A fragment) and cInit (f16 C tiles = skip)
     cInit = [[None, None] for _ in range(4)]
     if pre:
-        f0, f1 = inputs[0:4], inputs[4:8]
-        hw = []
-        for a, b in ((f0[0], f0[1]), (f0[2], f0[3]), (f1[0], f1[1]), (f1[2], f1[3])):
-            r = p.reg("b32"); p.emit(f"cvt.rn.f16x2.f32 {r}, {b}, {a};"); hw.append(r)
+        if pre_half:
+            hw = inputs
+        else:
+            f0, f1 = inputs[0:4], inputs[4:8]
+            hw = []
+            for a, b in ((f0[0], f0[1]), (f0[2], f0[3]), (f1[0], f1[1]), (f1[2], f1[3])):
+                r = p.reg("b32"); p.emit(f"cvt.rn.f16x2.f32 {r}, {b}, {a};"); hw.append(r)
         st_v4(stgLdE4, hw)
         warp_sync()
         fa = ldm4(p, stgA)

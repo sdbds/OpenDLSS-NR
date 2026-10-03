@@ -21,4 +21,5 @@ struct GpuImage {
   uint32_t format = 0;
   uint32_t layout = 0;
   uint32_t width = 0, height = 0;
+  uint32_t usage = 0;  // VkImageUsageFlags; 0 means unknown (retain the legacy copy route)
 };

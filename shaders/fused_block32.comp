@@ -42,6 +42,7 @@ layout(local_size_x = 256) in;  // two windows per workgroup, four subgroups (16
 layout(constant_id = 0) const uint FLAGS = 0;
 const uint F_SKIP_F16 = 1u;    // FFN residual is the f16 skip buffer (else the E4 state)
 const uint F_PRE = 8u;         // block 0: f32 input features x f16 adapter (binding 11) -> E4 state and f16 skip in registers
+const uint F_PRE_F16 = 256u;   // F_PRE input already stored as f16, with the same rounding as the F32 conversion
 const uint F_POST = 16u;       // block 70: learned_post_blend of the 2x-upsampled half-res E4 (binding 1) and block-0 E4 (binding 0)
 const uint F_HEAD = 32u;       // block 70: f16 head GEMM (binding 11, [32][16]) -> f32 RGBA (binding 9)
 const uint F_POOL = 64u;       // 2x2 box pool of the raw f16 output -> E4 half-resolution rows (binding 9)
@@ -67,6 +68,7 @@ layout(push_constant) uniform Push {
 
 layout(std430, binding = 0) readonly buffer State { uvec4 state4[]; };           // E4 [tokens][32] as 16-byte words (F_POST: block-0 output)
 layout(std430, binding = 0) readonly buffer Features { vec4 feat4[]; };          // F_PRE: f32 [tokens][16]
+layout(std430, binding = 0) readonly buffer FeaturesF16 { uvec4 feat16[]; };      // F_PRE_F16: f16 [tokens][16]
 layout(std430, binding = 1) readonly buffer Skip { uvec4 skip4[]; };             // f16 [tokens][32] as 16-byte words
 layout(std430, binding = 1) readonly buffer LowRes { uvec4 lowres4[]; };         // F_POST: E4 [lowTokens][32]; F_UPRES: f16 [lowTokens][32] (4 words)
 layout(std430, binding = 11) readonly buffer WeightsF16 { float16_t wf16[]; };   // F_PRE: [16 k][32 n]; F_HEAD: [32 k][16 n]
@@ -274,7 +276,8 @@ void main() {
       if (x0 >= 0 && y0 >= 0 && x0 < int(pc.width) && y0 < int(pc.height)) {
         const uint pixel = uint(y0) * pc.width + uint(x0);
         if ((FLAGS & F_PRE) != 0u) {
-          xw = floatBitsToUint(feat4[pixel * 4u + ldWord * 2u]); sk0 = floatBitsToUint(feat4[pixel * 4u + ldWord * 2u + 1u]);
+          if ((FLAGS & F_PRE_F16) != 0u) xw = feat16[pixel * 2u + ldWord];
+          else { xw = floatBitsToUint(feat4[pixel * 4u + ldWord * 2u]); sk0 = floatBitsToUint(feat4[pixel * 4u + ldWord * 2u + 1u]); }
         } else if ((FLAGS & F_POST) != 0u) {
           xw = state4[pixel * 2u + ldWord];
           sk0 = lowres4[((uint(y0) >> 1u) * pc.lowWidth + (uint(x0) >> 1u)) * 2u + ldWord];
@@ -315,10 +318,15 @@ void main() {
     // gemm_f16); the f16 result is the FFN skip, its E4M3 codes (NaN -> 0) the block state.
     {
       const uint w = SCR + (ldRow * 2u + ldWord) * 4u;
-      scratch32[w] = packFloat2x16(f16vec2(uintBitsToFloat(xw.xy)));
-      scratch32[w + 1u] = packFloat2x16(f16vec2(uintBitsToFloat(xw.zw)));
-      scratch32[w + 2u] = packFloat2x16(f16vec2(uintBitsToFloat(sk0.xy)));
-      scratch32[w + 3u] = packFloat2x16(f16vec2(uintBitsToFloat(sk0.zw)));
+      if ((FLAGS & F_PRE_F16) != 0u) {
+        scratch32[w] = xw.x; scratch32[w + 1u] = xw.y;
+        scratch32[w + 2u] = xw.z; scratch32[w + 3u] = xw.w;
+      } else {
+        scratch32[w] = packFloat2x16(f16vec2(uintBitsToFloat(xw.xy)));
+        scratch32[w + 1u] = packFloat2x16(f16vec2(uintBitsToFloat(xw.zw)));
+        scratch32[w + 2u] = packFloat2x16(f16vec2(uintBitsToFloat(sk0.xy)));
+        scratch32[w + 3u] = packFloat2x16(f16vec2(uintBitsToFloat(sk0.zw)));
+      }
     }
     subgroupBarrier();
     A16x16H fa; coopMatLoad(fa, scratch32, SCR, 8u, gl_CooperativeMatrixLayoutRowMajor);
@@ -410,7 +418,8 @@ void main() {
       if (xN >= 0 && yN >= 0 && xN < int(pc.width) && yN < int(pc.height)) {
         const uint pixel = uint(yN) * pc.width + uint(xN);
         if ((FLAGS & F_PRE) != 0u) {
-          xw = floatBitsToUint(feat4[pixel * 4u + ldWord * 2u]); sk0 = floatBitsToUint(feat4[pixel * 4u + ldWord * 2u + 1u]);
+          if ((FLAGS & F_PRE_F16) != 0u) xw = feat16[pixel * 2u + ldWord];
+          else { xw = floatBitsToUint(feat4[pixel * 4u + ldWord * 2u]); sk0 = floatBitsToUint(feat4[pixel * 4u + ldWord * 2u + 1u]); }
         } else if ((FLAGS & F_POST) != 0u) {
           xw = state4[pixel * 2u + ldWord];
           sk0 = lowres4[((uint(yN) >> 1u) * pc.lowWidth + (uint(xN) >> 1u)) * 2u + ldWord];

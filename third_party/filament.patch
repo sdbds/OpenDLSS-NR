@@ -1,9 +1,46 @@
+diff --git a/filament/backend/include/backend/DriverEnums.h b/filament/backend/include/backend/DriverEnums.h
+--- a/filament/backend/include/backend/DriverEnums.h
++++ b/filament/backend/include/backend/DriverEnums.h
+@@ -1087,6 +1087,7 @@ enum class TextureUsage : uint16_t {
+     BLIT_DST            = 0x0080,            //!< Texture can be used the destination of a blit()
+     PROTECTED           = 0x0100,            //!< Texture can be used for protected content
+     GEN_MIPMAPPABLE     = 0x0200,            //!< Texture can be used with generateMipmaps()
++    STORAGE             = 0x0400,            //!< Vulkan interop storage-image writes
+     DEFAULT             = UPLOADABLE | SAMPLEABLE,   //!< Default texture usage
+     ALL_ATTACHMENTS     = COLOR_ATTACHMENT | DEPTH_ATTACHMENT | STENCIL_ATTACHMENT | SUBPASS_INPUT,   //!< Mask of all attachments
+ };
+diff --git a/filament/backend/src/vulkan/VulkanTexture.cpp b/filament/backend/src/vulkan/VulkanTexture.cpp
+--- a/filament/backend/src/vulkan/VulkanTexture.cpp
++++ b/filament/backend/src/vulkan/VulkanTexture.cpp
+@@ -167,6 +167,9 @@ VkImageUsageFlags getUsage(VulkanContext const& context, uint8_t samples,
+     if (any(tusage & TextureUsage::BLIT_DST)) {
+         usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+     }
++    if (any(tusage & TextureUsage::STORAGE)) {
++        usage |= VK_IMAGE_USAGE_STORAGE_BIT;
++    }
+
+     if (any(tusage & TextureUsage::GEN_MIPMAPPABLE)) {
+         usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+diff --git a/filament/backend/src/vulkan/VulkanTexture.h b/filament/backend/src/vulkan/VulkanTexture.h
+--- a/filament/backend/src/vulkan/VulkanTexture.h
++++ b/filament/backend/src/vulkan/VulkanTexture.h
+@@ -224,6 +224,9 @@ struct VulkanTexture : public HwTexture, public fvkmemory::Resource {
+     VkImage getVkImage() const {
+         return mState->mTextureImage;
+     }
++    VkImageUsageFlags getVkUsage() const {
++        return mState->mUsage;
++    }
+
+     VulkanLayout getLayout(uint32_t layer, uint32_t level) const;
+
 diff --git a/filament/backend/include/backend/VulkanInterop.h b/filament/backend/include/backend/VulkanInterop.h
 new file mode 100644
-index 00000000..ade2cc67
+index 00000000..a9cc9d47
 --- /dev/null
 +++ b/filament/backend/include/backend/VulkanInterop.h
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,73 @@
 +/*
 + * Copyright (C) 2026 The Android Open Source Project
 + *
@@ -43,6 +80,7 @@ index 00000000..ade2cc67
 +    uint32_t height = 0;
 +    uint32_t levels = 0;
 +    uint32_t layers = 0;
++    VkImageUsageFlags usage = 0;
 +};
 +
 +/**
@@ -110,7 +148,7 @@ index 2067d874..f3b37c64 100644
      // the fn function will execute a batch of driver commands
      // this gives the driver a chance to wrap their execution in a meaningful manner
 diff --git a/filament/backend/src/vulkan/VulkanDriver.cpp b/filament/backend/src/vulkan/VulkanDriver.cpp
-index 5c4f5aef..08c0871d 100644
+index 5c4f5aef..e304dfc7 100644
 --- a/filament/backend/src/vulkan/VulkanDriver.cpp
 +++ b/filament/backend/src/vulkan/VulkanDriver.cpp
 @@ -35,6 +35,8 @@
@@ -122,7 +160,7 @@ index 5c4f5aef..08c0871d 100644
  #include <backend/DriverEnums.h>
  #include <backend/platforms/VulkanPlatform.h>
  
-@@ -3031,6 +3033,82 @@ void VulkanDriver::endTimerQuery(Handle<HwTimerQuery> tqh) {
+@@ -3031,6 +3033,83 @@ void VulkanDriver::endTimerQuery(Handle<HwTimerQuery> tqh) {
      mQueryManager.endQuery(&(mCommands.get()), vtq);
  }
  
@@ -154,6 +192,7 @@ index 5c4f5aef..08c0871d 100644
 +                .height = texture->height,
 +                .levels = texture->levels,
 +                .layers = range.layerCount,
++                .usage = texture->getVkUsage(),
 +            };
 +        }
 +        void setTextureLayout(uint32_t const textureHandle, VkImageLayout const layout) noexcept override {

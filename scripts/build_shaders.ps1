@@ -65,7 +65,7 @@ foreach ($cfg in @(@(512, 4), @(512, 5), @(512, 13), @(256, 5), @(4096, 5), @(10
   if ($LASTEXITCODE -ne 0) { exit 1 }
 }
 # fused 32-channel block variants: E4 out; E4 + pool; pre + E4 + pool; upres + E4; post + head
-foreach ($f in 2, 66, 74, 130, 48) {
+foreach ($f in 2, 66, 74, 330, 130, 48) {
   python (Join-Path $root "scripts\ptx\block32_e4m3.py") $f (Join-Path $ptxOut "block32_e4m3_f$f.ptx") | Out-Null
   if ($LASTEXITCODE -ne 0) { exit 1 }
 }
