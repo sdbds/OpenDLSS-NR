@@ -10,6 +10,7 @@
 
 #include "kernels.h"
 #include "nr_model.h"
+#include "nr_workspace.h"
 
 namespace nr {
 
@@ -21,6 +22,18 @@ struct Geometry {
   uint32_t vitTokens() const { return levels[5].width * levels[5].height; }
   uint32_t paddedVitTokens() const { return (vitTokens() + 63) & ~63u; }
 };
+
+enum class WorkspaceDomain : uint32_t {
+  Pre = 0, Encoder32 = 2, ToEncoder64 = 3, Encoder64 = 4, ToEncoder128 = 5,
+  Encoder128 = 6, ToEncoder256 = 7, Encoder256 = 8, ToEncoder512 = 9, Encoder512 = 10,
+  ToVit = 11, Vit = 12, ToDecoder512 = 13, Decoder512 = 14, ToDecoder256 = 15,
+  Decoder256 = 16, ToDecoder128 = 17, Decoder128 = 18, ToDecoder64 = 19, Decoder64 = 20,
+  ToDecoder32 = 21, Decoder32 = 22, Post = 24, FrameEnd = 26
+};
+
+std::string activationKey(const std::string& label, uint32_t rows, uint32_t channels, Format format);
+// CPU-only description of the default fused graph, excluding the caller's input.
+std::vector<WorkspaceRequest> graphWorkspaceRequests(const Geometry& geometry, bool fp16Head, uint32_t deferMax);
 
 struct FusedLayout {
   uint32_t hidden = 128, heads = 1;
@@ -43,6 +56,9 @@ class Graph {
     bool captureBoundaries = false;  // copy every block/transition output for parity checks
     bool captureIntermediates = false;  // also copy the intra-block tensors (FFN, QKV, attention)
     bool fusedBlocks = true;            // one fused dispatch per 32-channel block (false: reference kernels)
+    bool fp16Head = false;              // keep the head's original half results; default F32 preserves callers
+    bool reuseWorkspace = false;        // whole-buffer reuse for the supported fused route
+    bool poisonWorkspace = false;       // test reused storage's complete write coverage
   };
   Graph(vk::Context& context, Model& model, Kernels& kernels, const Geometry& geometry, Options options);
   ~Graph();
@@ -51,7 +67,8 @@ class Graph {
   // F32 is rounded to F16 before the input projection; F16 preserves that already-rounded input.
   void record(VkCommandBuffer commands, const Activation& inputFeatures);
 
-  const Activation& head() const { return *head_; }  // f32 [full rows][4]
+  // [full rows][4], F32 unless fp16Head is enabled. Consume before the next graph execution.
+  const Activation& head() const { return *head_; }
   const std::map<std::string, Activation*>& boundaries() const { return boundaries_; }
   const Geometry& geometry() const { return geometry_; }
   // Whether consecutive launches are linked by device counters instead of barriers (docs/execution.md).
@@ -61,8 +78,14 @@ class Graph {
   static const std::vector<std::string>& referenceBoundaryNames();
 
   Activation* allocate(const std::string& label, uint32_t rows, uint32_t channels, Format format);
+  std::string workspaceReport() const;
 
  private:
+  std::vector<WorkspaceRequest> makeWorkspaceRequests() const;
+  bool workspaceRouteSupported() const;
+  Activation* allocateInternal(const std::string& label, uint32_t rows, uint32_t channels, Format format);
+  void prepareWorkspace();
+  void enterWorkspaceDomain(VkCommandBuffer commands, uint32_t domain);
   // Window phases. Every resolution level runs its own four-phase cycle of half-window shifts; the phase advances
   // once per block at that level in visit order, and a decoder stage continues the count its encoder stage left.
   static constexpr int kFullLevel = 6;   // levels 0..5 are Geometry::levels, 6 is the un-pooled field
@@ -99,6 +122,8 @@ class Graph {
     Activation* normalized = nullptr;  // E4
     Activation* attended = nullptr;    // E4 [rows][512]
   };
+  bool usesPtxExpertFfn(uint32_t channels) const;
+  void prepareFusedAux(const Tensor& tensor, const FusedLayout& layout, uint32_t channels);
   Temporaries createTemporaries(const std::string& label, uint32_t rows, uint32_t channels);
   SplitTemporaries createSplitTemporaries(const std::string& label, uint32_t rows);
 
@@ -132,6 +157,19 @@ class Graph {
   Options options_;
   std::vector<std::unique_ptr<Activation>> activations_;
   std::map<std::string, Activation*> allocationsByKey_;
+  struct WorkspaceStorage {
+    vk::Context& context;
+    std::string label;
+    vk::Buffer buffer;
+    WorkspaceStorage(vk::Context& c, std::string name) : context(c), label(std::move(name)) {}
+    ~WorkspaceStorage() { context.destroyBuffer(buffer); }
+  };
+  std::vector<std::unique_ptr<WorkspaceStorage>> workspaceSlots_;
+  std::map<std::string, std::unique_ptr<Activation>> workspaceViews_;
+  std::vector<WorkspaceRequest> workspaceRequests_;
+  WorkspacePlan workspacePlan_;
+  bool workspacePrepared_ = false, workspaceActive_ = false;
+  int32_t workspaceDomain_ = -1;
   std::set<std::string> usedThisRecord_;
   std::map<std::string, Activation*> boundaries_;
   Activation* head_ = nullptr;

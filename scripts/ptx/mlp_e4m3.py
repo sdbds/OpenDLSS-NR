@@ -39,7 +39,9 @@ def hidden_permutation(hidden=HIDDEN):
     return perm
 
 
-def generate(K, stages=STAGES, ksub=KSUB, mt=MT, max_regs=None, HIDDEN=HIDDEN, NOUT=NOUT):
+def generate(K, stages=STAGES, ksub=KSUB, mt=MT, max_regs=None, HIDDEN=HIDDEN, NOUT=NOUT,
+             broadcast=True, raw_hidden=False, native_hidden=False):
+    assert not (raw_hidden and native_hidden)
     assert K % (32 * ksub) == 0
     BM = 64 * mt                      # rows per workgroup (4 warps x 16 mt)
     steps = K // (32 * ksub)          # pipeline stages (each ksub k32 tiles)
@@ -50,6 +52,9 @@ def generate(K, stages=STAGES, ksub=KSUB, mt=MT, max_regs=None, HIDDEN=HIDDEN, N
     w2_bytes = (HIDDEN // 32) * NOUT * 32   # W2 [HIDDEN/32 k32 tiles][NOUT n][32 k], staged once
     shared_bytes = STAGES_ * stage_bytes + w2_bytes
     name = f"mlp_e4m3_K{K}" + (f"_M{mt}" if mt != 1 else "") + (f"_H{HIDDEN}_N{NOUT}" if (HIDDEN, NOUT) != (128, 32) else "")
+    if not broadcast: name += "_split"
+    if raw_hidden: name += "_raw_hidden"
+    if native_hidden: name += "_native_hidden"
     p = Ptx()
     params = [("u64", "pA"), ("u64", "pW1"), ("u64", "pW2"), ("u64", "pD"), ("u32", "rows"), ("u32", "inputStride"),
               ("u32", "inputColumnBase"), ("u32", "outputStride"), ("u32", "outputColumnOffset")]
@@ -59,6 +64,7 @@ def generate(K, stages=STAGES, ksub=KSUB, mt=MT, max_regs=None, HIDDEN=HIDDEN, N
     inputColumnBase = p.load_param_u32("inputColumnBase"); outputStride = p.load_param_u32("outputStride")
     outputColumnOffset = p.load_param_u32("outputColumnOffset")
     tid = p.special("tid.x"); expert = p.special("ctaid.x"); rowGroup = p.special("ctaid.y")
+    if not broadcast: inputColumnBase = p.add32(inputColumnBase, p.mul32(expert, K))
     lane = p.and32(tid, 31); warp = p.shr32(tid, 5)
     blockRow = p.mul32(rowGroup, BM)
     smem = p.shared_addr(p.imm32(0))
@@ -197,6 +203,18 @@ def generate(K, stages=STAGES, ksub=KSUB, mt=MT, max_regs=None, HIDDEN=HIDDEN, N
         pLo = p.setp("eq.u32", lo, 0x7f); pHi = p.setp("eq.u32", hi, 0x7f)
         mLo = p.selp32(pLo, p.imm32(0xff00), p.imm32(0xffff)); mHi = p.selp32(pHi, p.imm32(0x00ff), p.imm32(0xffff))
         return p.and32(p.and32(w, mLo), mHi)
+    def hidden_pair(v):
+        w = e4pair(v)
+        if native_hidden:
+            return w
+        if not raw_hidden:
+            return nan_to_zero_pairs(w)
+        # A cooperative-matrix type conversion is not saturatedConvertEXT:
+        # values beyond the RNE overflow threshold (464) become E4 NaNs.
+        lo = p.and32(v, 0x7fff); hi = p.and32(p.shr32(v, 16), 0x7fff)
+        low = p.selp32(p.setp("gt.u32", lo, 0x5f40), p.imm32(0x7f), p.and32(w, 0xff))
+        high = p.selp32(p.setp("gt.u32", hi, 0x5f40), p.imm32(0x7f00), p.and32(w, 0xff00))
+        return p.or32(low, high)
     aFrags = []
     for acc in accs:
         aFrag = []
@@ -205,7 +223,7 @@ def generate(K, stages=STAGES, ksub=KSUB, mt=MT, max_regs=None, HIDDEN=HIDDEN, N
             for half in range(2):
                 for pair in range(2):
                     tA, tB = 4 * kt + 2 * pair, 4 * kt + 2 * pair + 1
-                    wA = nan_to_zero_pairs(e4pair(acc[tA][half])); wB = nan_to_zero_pairs(e4pair(acc[tB][half]))
+                    wA = hidden_pair(acc[tA][half]); wB = hidden_pair(acc[tB][half])
                     r = p.reg("b32"); p.emit(f"prmt.b32 {r}, {wA}, {wB}, 0x5410;")   # bytes: wA.0 wA.1 wB.0 wB.1
                     regs4.append(r)
             # order a0 (g, first pair), a1 (g+8, first pair), a2 (g, second pair), a3 (g+8, second pair)

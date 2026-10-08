@@ -24,7 +24,7 @@ STAGES = 3
 STAGE_BYTES = (BM + BN) * 32
 
 
-def generate(K, flags, max_regs=None, stagesWanted=STAGES, ksub=1, ws=False):
+def generate(K, flags, max_regs=None, stagesWanted=STAGES, ksub=1, ws=False, valid_n=64):
     """ws: warp-specialized copies - warp 4 issues every cp.async (the LSU accepts ~16 B/cycle per SM and a
     cp.async issue blocks the issuing warp), warps 0..3 only run ldmatrix + MMA; the stages hand over through
     named barriers FULL(slot) / EMPTY(slot). The launch has 160 threads (the PTX carries `// threads 160`)."""
@@ -35,7 +35,9 @@ def generate(K, flags, max_regs=None, stagesWanted=STAGES, ksub=1, ws=False):
     STAGE_BYTES = ksub * (BM + BN) * 32
     res, siluF, outE4, outF16 = bool(flags & F_RES), bool(flags & F_SILU), bool(flags & F_E4), bool(flags & F_F16)
     assert outE4 or outF16
+    assert valid_n == 64 or (valid_n == 32 and flags == F_F16 and not ws)
     name = f"gemm2_e4m3_K{K}_f{flags}" + (f"_s{ksub}" if ksub != 1 else "")
+    if valid_n != 64: name += f"_n{valid_n}"
     RESS = stages * STAGE_BYTES            # residual E4 tile [64][64 B] (4 KB), then the E4 output tile
     shared_bytes = RESS + 4096
     NT = THREADS + 32 if ws else THREADS   # + the copy warp
@@ -254,6 +256,9 @@ def generate(K, flags, max_regs=None, stagesWanted=STAGES, ksub=1, ws=False):
             row = p.shr32(c, 3); chunk = p.and32(c, 7)
             gRow = p.add32(blockRow, row)
             ok = p.setp("lt.u32", gRow, P["rows"])
+            if valid_n != 64:
+                within = p.setp("lt.u32", chunk, valid_n // 8)
+                p.emit(f"and.pred {ok}, {ok}, {within};")
             gOff = p.add32(p.mul32(gRow, P["outputStride"]), p.add32(P["outputColumnOffset"], p.add32(colBase, p.shl32(chunk, 3))))
             r = p.regs("b32", 4)
             p.emit(f"ld.shared.v4.b32 {{{r[0]}, {r[1]}, {r[2]}, {r[3]}}}, [{p.add32(smem, p.add32(p.shl32(row, 7), p.shl32(chunk, 4)))}];")

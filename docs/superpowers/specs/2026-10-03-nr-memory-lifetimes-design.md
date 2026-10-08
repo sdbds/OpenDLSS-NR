@@ -2,8 +2,10 @@
 
 Date: 2026-10-03
 
-Status: Proposed design, awaiting written-spec approval. No implementation of
-workspace reuse has been made.
+Status: Spec and implementation plan approved by the user on 2026-10-03.
+Implementation and targeted verification completed on 2026-10-03. NrPass reuse
+is enabled by default after exact-output and measured-LOCAL gates. Results and
+the newly selected community-DLL target are in `docs/optimization-validation.md`.
 
 ## Intent and Baseline
 
@@ -93,6 +95,8 @@ PTX families and both head storage formats. Do not force a new kernel route.
 - The full-resolution block-0 output remains live through block 70.
 - Encoder skips remain live through their decoder consumer. A state buffer is
   not scratch merely because its encoder stage has completed.
+- The final decoder-32 state remains live through block 70's low-resolution
+  reads. It cannot share the head's slot during that block.
 - Two buffers used by the same dispatch cannot occupy the same slot unless
   the existing kernel already has an explicit in-place contract; this change
   introduces no new in-place operations.

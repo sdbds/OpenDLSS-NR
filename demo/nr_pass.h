@@ -36,7 +36,7 @@ struct NrTimings {
 class NrPass {
  public:
   NrPass(const GpuDevice& device, uint32_t width, uint32_t height, const std::string& modelDir, const std::string& kernelDir,
-         const std::string& demoShaderDir);
+         const std::string& demoShaderDir, bool reuseWorkspace = true);
   ~NrPass();
 
   uint32_t width() const { return width_; }
@@ -45,6 +45,7 @@ class NrPass {
   // activations, the images, the descriptor sets and the pre-recorded command buffers are rebuilt (~50 ms)
   void resize(uint32_t width, uint32_t height);
   vk::Context& context() { return *context_; }
+  std::string workspaceReport() const { return graph_->workspaceReport(); }
 
   // What record() needs of a frame, decided on the main thread (the renderer runs the recording on its own thread,
   // possibly after the main thread moved on to the next frame)
@@ -98,7 +99,8 @@ class NrPass {
   struct ExternalView {
     VkImage image = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; VkFormat format = VK_FORMAT_UNDEFINED;
   };
-  Image createImage(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect);
+  Image createImage(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage,
+                    VkImageAspectFlags aspect, const char* label);
   void destroyImage(Image& image);
   void transition(VkCommandBuffer commands, Image& image, VkImageLayout layout, VkPipelineStageFlags srcStage, VkAccessFlags srcAccess,
                   VkPipelineStageFlags dstStage, VkAccessFlags dstAccess, VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT);
@@ -122,6 +124,7 @@ class NrPass {
   VkDevice device_ = VK_NULL_HANDLE;
   uint32_t width_ = 0, height_ = 0;
   float blendScale_ = 1.0f;
+  bool reuseWorkspace_ = false;
 
   Image sceneMotion_, history_[2], output_;  // output_ is allocated lazily for the copy fallback only
   ExternalView color_, velocity_, target_;

@@ -28,8 +28,9 @@ struct UnpackPush { float background[16]; uint32_t width, height; };
 uint32_t NrPass::shaderReadOnlyLayout() { return (uint32_t)VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; }
 
 NrPass::NrPass(const GpuDevice& device, uint32_t width, uint32_t height, const std::string& modelDir, const std::string& kernelDir,
-               const std::string& demoShaderDir)
-    : device_((VkDevice)device.device), width_(width), height_(height), demoShaderDir_(demoShaderDir) {
+               const std::string& demoShaderDir, bool reuseWorkspace)
+    : device_((VkDevice)device.device), width_(width), height_(height), reuseWorkspace_(reuseWorkspace),
+      demoShaderDir_(demoShaderDir) {
   context_ = std::make_unique<vk::Context>((VkInstance)device.instance, (VkPhysicalDevice)device.physicalDevice, device_,
                                            device.queueFamily, device.nrQueueIndex);
   fprintf(stderr, "[nr] context adopted (%s, queue %u.%u)\n", context_->deviceName().c_str(), device.queueFamily, device.nrQueueIndex);
@@ -52,7 +53,8 @@ NrPass::NrPass(const GpuDevice& device, uint32_t width, uint32_t height, const s
   VK_CHECK(vkCreateSampler(device_, &samplerInfo, nullptr, &nearestSampler_));
   // the parameters are written into the command stream (vkCmdUpdateBuffer): device-local, one per parity
   for (vk::Buffer& b : params_)
-    b = context_->createBuffer(sizeof(ParamsBlock), false, "nr params", VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    b = context_->createBuffer(sizeof(ParamsBlock), false, "nr params", VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                               vk::MemoryOwner::Pass);
 
   // ---- compute pipelines: preprocess / composite share one layout (7 bindings); the motion unpack has its own
   VkDescriptorSetLayoutBinding bindings[7] = {
@@ -106,7 +108,8 @@ NrPass::NrPass(const GpuDevice& device, uint32_t width, uint32_t height, const s
 void NrPass::createSized(uint32_t width, uint32_t height) {
   width_ = width; height_ = height;
   geometry_ = nr::Geometry::fromValid(width, height);
-  graph_ = std::make_unique<nr::Graph>(*context_, *model_, *kernels_, geometry_, nr::Graph::Options{});
+  graph_ = std::make_unique<nr::Graph>(*context_, *model_, *kernels_, geometry_,
+                                      nr::Graph::Options{.fp16Head = true, .reuseWorkspace = reuseWorkspace_});
   features_ = graph_->allocate("input features", geometry_.fullWidth * geometry_.fullHeight, 16, nr::Format::F16);
   {
     // a warm-up record + run: the graph allocates its activations (the head among them) at the first record, and
@@ -120,10 +123,10 @@ void NrPass::createSized(uint32_t width, uint32_t height) {
   // (TRANSFER_DST: each is cleared once below)
   sceneMotion_ = createImage(width, height, VK_FORMAT_R16G16B16A16_SFLOAT,
                              VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                             VK_IMAGE_ASPECT_COLOR_BIT);
-  for (Image& h : history_)
-    h = createImage(width, height, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                    VK_IMAGE_ASPECT_COLOR_BIT);
+                             VK_IMAGE_ASPECT_COLOR_BIT, "nr motion");
+  for (uint32_t h = 0; h < 2; ++h)
+    history_[h] = createImage(width, height, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                              VK_IMAGE_ASPECT_COLOR_BIT, h == 0 ? "nr history 0" : "nr history 1");
   {
     // the storage images live in GENERAL for their whole life
     VkCommandBuffer commands = context_->beginCommands();
@@ -192,30 +195,44 @@ NrPass::~NrPass() {
   kernels_.reset(); model_.reset(); context_.reset();
 }
 
-NrPass::Image NrPass::createImage(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect) {
+NrPass::Image NrPass::createImage(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage,
+                                 VkImageAspectFlags aspect, const char* label) {
+  const uint32_t texelBytes = format == VK_FORMAT_R16G16B16A16_SFLOAT ? 8u :
+                              format == VK_FORMAT_R8G8B8A8_UNORM ? 4u : 0u;
+  if (!texelBytes || !width || !height || (uint64_t)width * height > UINT64_MAX / texelBytes)
+    throw std::runtime_error("unsupported NR image allocation");
   Image image; image.format = format;
   VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   info.imageType = VK_IMAGE_TYPE_2D; info.format = format; info.extent = {width, height, 1};
   info.mipLevels = 1; info.arrayLayers = 1; info.samples = VK_SAMPLE_COUNT_1_BIT; info.tiling = VK_IMAGE_TILING_OPTIMAL;
   info.usage = usage; info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   VK_CHECK(vkCreateImage(device_, &info, nullptr, &image.image));
-  VkMemoryRequirements req; vkGetImageMemoryRequirements(device_, image.image, &req);
-  VkPhysicalDeviceMemoryProperties props; vkGetPhysicalDeviceMemoryProperties(context_->physical(), &props);
-  uint32_t type = UINT32_MAX;
-  for (uint32_t i = 0; i < props.memoryTypeCount; ++i)
-    if ((req.memoryTypeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { type = i; break; }
-  if (type == UINT32_MAX) throw std::runtime_error("no device-local memory for an image");
-  VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; alloc.allocationSize = req.size; alloc.memoryTypeIndex = type;
-  VK_CHECK(vkAllocateMemory(device_, &alloc, nullptr, &image.memory));
-  VK_CHECK(vkBindImageMemory(device_, image.image, image.memory, 0));
-  VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-  viewInfo.image = image.image; viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D; viewInfo.format = format;
-  viewInfo.subresourceRange = {aspect, 0, 1, 0, 1};
-  VK_CHECK(vkCreateImageView(device_, &viewInfo, nullptr, &image.view));
-  return image;
+  try {
+    VkMemoryRequirements req; vkGetImageMemoryRequirements(device_, image.image, &req);
+    VkPhysicalDeviceMemoryProperties props; vkGetPhysicalDeviceMemoryProperties(context_->physical(), &props);
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < props.memoryTypeCount; ++i)
+      if ((req.memoryTypeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { type = i; break; }
+    if (type == UINT32_MAX) throw std::runtime_error("no device-local memory for an image");
+    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; alloc.allocationSize = req.size; alloc.memoryTypeIndex = type;
+    VK_CHECK(vkAllocateMemory(device_, &alloc, nullptr, &image.memory));
+    VK_CHECK(vkBindImageMemory(device_, image.image, image.memory, 0));
+    VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    viewInfo.image = image.image; viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D; viewInfo.format = format;
+    viewInfo.subresourceRange = {aspect, 0, 1, 0, 1};
+    VK_CHECK(vkCreateImageView(device_, &viewInfo, nullptr, &image.view));
+    context_->trackImageAllocation(image.memory, (VkDeviceSize)width * height * texelBytes, req.size, type, label);
+    return image;
+  } catch (...) {
+    if (image.view) vkDestroyImageView(device_, image.view, nullptr);
+    vkDestroyImage(device_, image.image, nullptr);
+    if (image.memory) vkFreeMemory(device_, image.memory, nullptr);
+    throw;
+  }
 }
 
 void NrPass::destroyImage(Image& image) {
+  if (image.memory) context_->untrackImageAllocation(image.memory);
   if (image.view) vkDestroyImageView(device_, image.view, nullptr);
   if (image.image) vkDestroyImage(device_, image.image, nullptr);
   if (image.memory) vkFreeMemory(device_, image.memory, nullptr);
@@ -273,6 +290,7 @@ void NrPass::updateComputeSets() {
       VkDescriptorImageInfo prev{linearSampler_, history_[h].view, VK_IMAGE_LAYOUT_GENERAL};
       VkDescriptorImageInfo motion{nearestSampler_, sceneMotion_.view, VK_IMAGE_LAYOUT_GENERAL};
       const nr::Activation& head = graph_->head();
+      if (head.format != nr::Format::F16) throw std::runtime_error("NR composite expects an F16 neural head");
       VkDescriptorBufferInfo buffer{k == 0 ? features_->buffer.buffer : head.buffer.buffer, 0, VK_WHOLE_SIZE};
       VkDescriptorBufferInfo params{params_[h].buffer, 0, sizeof(ParamsBlock)};
       VkDescriptorImageInfo out{VK_NULL_HANDLE, directOutput_ ? target_.view : output_.view, VK_IMAGE_LAYOUT_GENERAL};
@@ -414,7 +432,7 @@ void NrPass::record(void* commandBuffer, const Frame& frame, const GpuImage& col
     target_ = ExternalView{};
     if (!output_.image) {
       output_ = createImage(width_, height_, VK_FORMAT_R8G8B8A8_UNORM,
-                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT, "nr copy output");
       changed = true;
     }
   }
@@ -484,7 +502,7 @@ void NrPass::record(void* commandBuffer, const Frame& frame, const GpuImage& col
 
 std::vector<uint8_t> NrPass::readImage(VkImage image, uint32_t bytesPerPixel, VkImageLayout layout) {
   VK_CHECK(vkDeviceWaitIdle(device_));
-  vk::Buffer staging = context_->createBuffer((VkDeviceSize)width_ * height_ * bytesPerPixel, true, "capture");
+  vk::Buffer staging = context_->createBuffer((VkDeviceSize)width_ * height_ * bytesPerPixel, true, "capture", 0, vk::MemoryOwner::Pass);
   VkCommandBuffer commands = context_->beginCommands();
   barrier(commands, image, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -531,12 +549,20 @@ void NrPass::saveOutput(const std::string& path, bool sceneInstead) {
   if (!sceneInstead) {
     // the network's temporal blend weights (head channel 3 -> sigmoid x blend_scale) over the valid area
     const nr::Activation& head = graph_->head();
+    if (head.format != nr::Format::F16 && head.format != nr::Format::F32)
+      throw std::runtime_error("unsupported neural head storage format");
     std::vector<uint8_t> raw = context_->download(head.buffer, head.validBytes(), 0);
-    const float* values = (const float*)raw.data();
     double sum = 0, low = 0, high = 0; size_t count = 0;
     for (uint32_t y = 0; y < height_; ++y)
       for (uint32_t x = 0; x < width_; ++x) {
-        float w = values[((size_t)y * geometry_.fullWidth + x) * 4 + 3];
+        const size_t index = ((size_t)y * geometry_.fullWidth + x) * 4 + 3;
+        float w;
+        if (head.format == nr::Format::F16) {
+          uint16_t bits; memcpy(&bits, raw.data() + index * sizeof(bits), sizeof(bits));
+          w = num::f16ToF32(bits);
+        } else {
+          memcpy(&w, raw.data() + index * sizeof(w), sizeof(w));
+        }
         float weight = std::fmin(std::fmax((1.0f / (1.0f + std::exp(-w))) * blendScale_, 0.0f), 1.0f);
         sum += weight; count++; if (weight < 0.1f) low++; if (weight > 0.5f) high++;
       }

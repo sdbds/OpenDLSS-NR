@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -21,6 +22,8 @@
 
 namespace vk {
 
+class CommandTrace;
+
 struct Buffer {
   VkBuffer buffer = VK_NULL_HANDLE;
   VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -28,6 +31,33 @@ struct Buffer {
   bool hostVisible = false;
   void* mapped = nullptr;
   const char* label = "";
+};
+
+enum class MemoryOwner { Context, Model, Kernels, Graph, Pass, Unspecified, Count };
+enum class MemoryKind { Buffer, Image };
+
+struct MemoryCounters {
+  VkDeviceSize liveBytes = 0, peakBytes = 0, liveLogicalBytes = 0;
+  uint64_t allocationCount = 0, freeCount = 0;
+};
+
+struct MemoryRecord {
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  VkDeviceSize logicalBytes = 0, allocatedBytes = 0;
+  uint32_t memoryType = 0, heap = 0;
+  VkMemoryPropertyFlags properties = 0;
+  MemoryOwner owner = MemoryOwner::Unspecified;
+  MemoryKind kind = MemoryKind::Buffer;
+  std::string label;
+};
+
+struct MemorySnapshot : MemoryCounters {
+  std::array<MemoryCounters, VK_MAX_MEMORY_HEAPS> heaps{};
+  std::array<MemoryCounters, static_cast<size_t>(MemoryOwner::Count)> owners{};
+  std::array<VkMemoryHeapFlags, VK_MAX_MEMORY_HEAPS> heapFlags{};
+  uint32_t heapCount = 0;
+  std::vector<MemoryRecord> records;
+  std::string report(const char* phase, bool includeRecords = false) const;
 };
 
 constexpr uint32_t kGenericBindings = 12;
@@ -92,17 +122,27 @@ class Context {
   VkQueue queue() const { return queue_; }
   VkPhysicalDevice physical() const { return physical_; }
   float timestampPeriodNs() const { return timestampPeriod_; }
+  // Non-owning initialization-time recording sink; it must outlive this Context.
+  void setCommandTrace(CommandTrace* trace) { trace_ = trace; }
+  CommandTrace* commandTrace() const { return trace_; }
   VkPipelineLayout pipelineLayout() const { return pipelineLayout_; }
   VkDescriptorSetLayout setLayout() const { return setLayout_; }
   const std::string& deviceName() const { return deviceName_; }
 
   // Buffers -----------------------------------------------------------------
   Buffer createBuffer(VkDeviceSize size, bool hostVisible, const char* label,
-                      VkBufferUsageFlags extra = 0);
+                      VkBufferUsageFlags extra = 0, MemoryOwner owner = MemoryOwner::Unspecified);
   void destroyBuffer(Buffer& buffer);
+  // Allocation bytes owned by this Context's clients, not process residency.
+  MemorySnapshot memorySnapshot() const;
+  void trackImageAllocation(VkDeviceMemory memory, VkDeviceSize logicalBytes, VkDeviceSize allocatedBytes,
+                            uint32_t memoryType, const char* label);
+  void untrackImageAllocation(VkDeviceMemory memory);
   // Upload through a staging buffer and wait for completion.
   void upload(const Buffer& target, const void* data, VkDeviceSize size, VkDeviceSize offset = 0);
   void fillZero(const Buffer& target);
+  void clearBuffer(VkCommandBuffer commands, const Buffer& target, uint32_t value = 0);
+  void copyBuffer(VkCommandBuffer commands, const Buffer& source, const Buffer& destination, VkDeviceSize bytes);
   // Download via staging buffer and wait for completion.
   std::vector<uint8_t> download(const Buffer& source, VkDeviceSize size, VkDeviceSize offset = 0);
   const Buffer& dummyBuffer() const { return dummy_; }
@@ -145,6 +185,9 @@ class Context {
   uint32_t maxComputeSharedMemory() const { return maxSharedMemory_; }
 
  private:
+  void trackAllocation(VkDeviceMemory memory, VkDeviceSize logicalBytes, VkDeviceSize allocatedBytes,
+                        uint32_t memoryType, MemoryOwner owner, MemoryKind kind, const char* label);
+  void untrackAllocation(VkDeviceMemory memory, MemoryKind kind);
   uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required);
   VkInstance instance_ = VK_NULL_HANDLE;
   VkDebugUtilsMessengerEXT messenger_ = VK_NULL_HANDLE;
@@ -167,10 +210,13 @@ class Context {
   bool captureStatistics_ = false;
   bool owned_ = true;
   std::string deviceName_;
-  void initCommon();   // properties, memory types, command pool, layouts, pools, staging
+  void initCommon(VkDeviceSize stagingBytes);   // properties, memory types, command pool, layouts, pools, staging
   Buffer dummy_;
   Buffer staging_;
   std::vector<VkShaderModule> modules_;
+  CommandTrace* trace_ = nullptr;
+  std::map<VkDeviceMemory, MemoryRecord> allocations_;
+  MemorySnapshot memoryStats_;
 };
 
 }  // namespace vk

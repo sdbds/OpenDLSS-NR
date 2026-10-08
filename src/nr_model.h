@@ -10,6 +10,8 @@
 
 namespace nr {
 
+struct AuxRange { uint32_t byteOffset = 0, byteLength = 0; };
+
 struct Tensor {
   std::string name;
   int block = 0;
@@ -19,7 +21,17 @@ struct Tensor {
   uint32_t stageOffset = 0;
   uint32_t byteLength = 0;
   const uint8_t* bytes = nullptr;  // into the owning stage
-  vk::Buffer raw;                  // raw packed bytes on the GPU (aux vectors, scales)
+
+  // GPU auxiliary data contains only declared ranges, not the packed matrix bytes.
+  // Kernel arguments retain source byte offsets; translate them at the GPU boundary.
+  const vk::Buffer& auxBuffer() const;
+  uint32_t auxOffset(uint32_t byteOffset, uint32_t byteLength) const;
+
+ private:
+  friend class Model;
+  struct AuxRegion { AuxRange source; uint32_t bufferOffset = 0; };
+  std::vector<AuxRegion> auxRegions_;
+  vk::Buffer aux_;
 };
 
 // Native within-32 chained activation index used by every FP8 GEMM A operand.
@@ -34,6 +46,11 @@ class Model {
   ~Model();
 
   const Tensor& tensor(int block, int layer = 0, const std::string& parameter = "layer") const;
+
+  // Prepare a complete, immutable aux layout for a tensor owned by this Model.
+  // Ranges are packed on 16-byte boundaries. Repeated identical plans reuse the buffer;
+  // a changed plan is rejected because recorded commands may already hold its address.
+  void prepareAux(const Tensor& tensor, std::vector<AuxRange> ranges);
 
   // Plain [K][Nmatrix] E4M3 matrix for coopmat B loads. When swizzleK is set the
   // K rows are permuted by the inverse chained index so that A operands load in

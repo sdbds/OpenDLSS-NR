@@ -9,16 +9,16 @@ GLSL kernel (same instructions on the same fragment elements); only the data mov
 
 Variants (flags): PRE (block 0: f32 features, or f16 with PRE_F16, x f16 adapter), POST (block 70: learned post
 blend of block-0 E4 and the 2x upsampled half-res E4), UPRES (block 66: f16 low-res projection + E4 skip *
-scale), HEAD (RGBA head from the f16 result), POOL (2x2 box pool of the f16 result to E4), OUT_E4.
+scale), HEAD (RGBA head from the f16 result, stored as f16 with HEAD_F16), POOL (2x2 box pool of the f16 result to E4), OUT_E4.
 
-python block32_e4m3.py <flags> out.ptx      flags: sum of E4=2 PRE=8 POST=16 HEAD=32 POOL=64 UPRES=128 PRE_F16=256
+python block32_e4m3.py <flags> out.ptx      flags: sum of E4=2 PRE=8 POST=16 HEAD=32 POOL=64 UPRES=128 PRE_F16=256 HEAD_F16=512
 """
 import sys
 from ptxgen import Ptx
 from swin import *
 
 F_OUT_E4, F_PRE, F_POST, F_HEAD, F_POOL, F_UPRES = 2, 8, 16, 32, 64, 128
-F_PRE_F16 = 256
+F_PRE_F16, F_HEAD_F16 = 256, 512
 
 # shared memory map (bytes)
 W1S, W2S, WQKVS, WPROJS = 0, 4096, 8192, 11264
@@ -36,6 +36,8 @@ def generate(flags, max_regs=None):
     pre_half = bool(flags & F_PRE_F16)
     assert not pre_half or pre
     head, pool, outE4 = bool(flags & F_HEAD), bool(flags & F_POOL), bool(flags & F_OUT_E4)
+    head_half = bool(flags & F_HEAD_F16)
+    assert not head_half or head
     assert pre + post + upres <= 1
     name = f"block32_e4m3_f{flags}"
     p = Ptx()
@@ -462,12 +464,17 @@ def generate(flags, max_regs=None):
             xo = p.add32(windowX, g); yo = p.add32(windowY, p.add32(p.shl32(warp, 1), p.imm32(h)))
             pvx = p.setp("lt.u32", xo, P["width"]); pvy = p.setp("lt.u32", yo, P["height"])
             pv = p.reg("pred"); p.emit(f"and.pred {pv}, {pvx}, {pvy};"); p.emit(f"and.pred {pv}, {pv}, {pT2};")
-            lo, hi = unpack16(p, hd[h])
-            f0 = p.reg("f32"); p.emit(f"cvt.f32.f16 {f0}, {lo};")
-            f1 = p.reg("f32"); p.emit(f"cvt.f32.f16 {f1}, {hi};")
-            px = p.mad32(yo, P["width"], xo)
-            addr = p.add64(P["pOut2"], p.widen(p.add32(p.shl32(px, 4), p.shl32(t, 3))))
-            p.emit(f"@{pv} st.global.v2.f32 [{addr}], {{{f0}, {f1}}};")
+            if head_half:
+                px = p.mad32(yo, P["width"], xo)
+                addr = p.add64(P["pOut2"], p.widen(p.add32(p.shl32(px, 3), p.shl32(t, 2))))
+                p.emit(f"@{pv} st.global.b32 [{addr}], {hd[h]};")
+            else:
+                lo, hi = unpack16(p, hd[h])
+                f0 = p.reg("f32"); p.emit(f"cvt.f32.f16 {f0}, {lo};")
+                f1 = p.reg("f32"); p.emit(f"cvt.f32.f16 {f1}, {hi};")
+                px = p.mad32(yo, P["width"], xo)
+                addr = p.add64(P["pOut2"], p.widen(p.add32(p.shl32(px, 4), p.shl32(t, 3))))
+                p.emit(f"@{pv} st.global.v2.f32 [{addr}], {{{f0}, {f1}}};")
     p.emit("fence.acq_rel.gpu;")
     p.emit("bar.sync 0;")   # K / V and staging are reused by the next window; the window's stores are released
     pSig = p.reg("pred"); p.emit(f"and.pred {pSig}, {pSignalOn}, {p.setp('eq.u32', tid, 0)};")

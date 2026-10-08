@@ -20,7 +20,7 @@ KROWS = 2048                  # [padded][32 B] swizzled
 
 
 
-def generate(padded):
+def generate(padded, fused_norm=False):
     assert padded % 64 == 0 and padded <= 256
     blocks = padded // 64
     VT = KROWS + padded * 32                        # [32 dims][VT_STRIDE B]
@@ -75,7 +75,7 @@ def generate(padded):
     qL = p.label("QDONE")
     p.emit(f"@!{pQ} bra {qL};")
     wq = load_row(qToken, qValid, 0)
-    qc = vit_quantize(p, wq, vit_norm(p, wq), True, hs2, learned2, zero32)
+    qc = vit_quantize(p, wq, vit_norm(p, wq, fused_norm), True, hs2, learned2, zero32)
     qc = [p.selp32(qValid, c, zero32) for c in qc]
     store_row16(p.add32(smem, p.imm32(QROWS)), tid, qc)
     p.emit(f"{qL}:")
@@ -91,7 +91,7 @@ def generate(padded):
         if pIn is not None: p.emit(f"@!{pIn} bra {skipL};")
         wk = load_row(token, valid, 1)
         wv = load_row(token, valid, 2)
-        kc = vit_quantize(p, wk, vit_norm(p, wk), False, hs2, learned2, zero32)
+        kc = vit_quantize(p, wk, vit_norm(p, wk, fused_norm), False, hs2, learned2, zero32)
         kc = [p.selp32(valid, c, zero32) for c in kc]
         store_row16(p.add32(smem, p.imm32(KROWS)), token, kc)
         vc = [pack16(p, cvt_e4x2(p, wv[2 * i]), cvt_e4x2(p, wv[2 * i + 1])) for i in range(8)]

@@ -36,7 +36,7 @@ def key_position(p, token):
                   p.or32(p.and32(token, 1), p.shl32(p.shr32(p.and32(token, 15), 3), 1)))
 
 
-def generate_normalize():
+def generate_normalize(fused_norm=False):
     name = "global_normalize_e4m3"
     p = Ptx()
     params = [("u64", "pQkv"), ("u64", "pAux"), ("u64", "pOut"), ("u32", "tokens"), ("u32", "padded"), ("u32", "heads"),
@@ -67,8 +67,8 @@ def generate_normalize():
             w += r
         return w
     wq = load_row(0); wk = load_row(1); wv = load_row(2)
-    qc = vit_quantize(p, wq, vit_norm(p, wq), True, hs2, learned2, zero32)
-    kc = vit_quantize(p, wk, vit_norm(p, wk), False, hs2, learned2, zero32)
+    qc = vit_quantize(p, wq, vit_norm(p, wq, fused_norm), True, hs2, learned2, zero32)
+    kc = vit_quantize(p, wk, vit_norm(p, wk, fused_norm), False, hs2, learned2, zero32)
     vc = [pack16(p, cvt_e4x2(p, wv[2 * i]), cvt_e4x2(p, wv[2 * i + 1])) for i in range(8)]
     qc = [p.selp32(valid, c, zero32) for c in qc]
     kc = [p.selp32(valid, c, zero32) for c in kc]

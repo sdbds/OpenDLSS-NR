@@ -54,3 +54,14 @@ inline std::string sha256Hex(const uint8_t* data, size_t length) {
     for (int shift = 28; shift >= 0; shift -= 4) hex += digits[(word >> shift) & 0xf];
   return hex;
 }
+
+inline bool sha256Matches(const uint8_t* data, size_t length, const std::string& expected) {
+  if (expected.size() != 64) return false;
+  const std::string actual = sha256Hex(data, length);
+  for (size_t i = 0; i < actual.size(); ++i) {
+    char digit = expected[i];
+    if (digit >= 'a' && digit <= 'f') digit = static_cast<char>(digit - 'a' + 'A');
+    if (actual[i] != digit) return false;
+  }
+  return true;
+}

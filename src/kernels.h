@@ -1,5 +1,7 @@
 // Compute kernel wrappers: pipeline specialization cache plus dispatch helpers with the exact operand contracts
 // of the network (GLSL cooperative-matrix reference kernels and the PTX kernels of scripts/ptx/).
+// Auxiliary offsets refer to the original CPU Tensor bytes. Model::prepareAux must run first;
+// these wrappers translate the offsets to the tensor's immutable, compact GPU buffer.
 #pragma once
 #include <map>
 #include <string>
@@ -104,7 +106,7 @@ class Kernels {
     const Activation* lowProjection = nullptr;   // F_UPRES: half-resolution f16 projection (state = E4 skip, scaled by inputScale)
     uint32_t inputScaleByteOffset = 0, adapterScaleByteOffset = 0, lowWidth = 0;   // F_POST
     const vk::Buffer* headWeights = nullptr;   // F_HEAD: f16 [32][16] (f16Matrix layout 2, padded)
-    Activation* head = nullptr;             // F_HEAD: f32 [tokens][4] output (replaces outF16)
+    Activation* head = nullptr;             // F_HEAD: f32 or f16 [tokens][4] output (replaces outF16)
     Activation* pooled = nullptr;           // F_POOL: E4 half-resolution 2x2 box pool of the raw output (replaces outF16)
     uint32_t pooledWidth = 0;
     const Activation* state = nullptr;      // E4 [tokens][32]

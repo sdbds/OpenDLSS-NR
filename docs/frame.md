@@ -1,6 +1,7 @@
 # The frame: from a rendered image to pixels
 
-The network takes 16 f16 or f32 lanes per padded pixel and returns 4 f32 lanes. Everything around that (building the lanes,
+The network takes 16 f16 or f32 lanes per padded pixel and returns 4 lanes, stored as f32 by default or f16 with
+`Graph::Options::fp16Head`. Everything around that (building the lanes,
 turning the head into an image, and the temporal loop) is the *pipeline*, and it is as much a part of matching
 NVIDIA's output as the network is. `demo/` implements it; `demo/README.md` covers building and driving the demo,
 this file covers what it computes and why.
@@ -13,7 +14,7 @@ this file covers what it computes and why.
  motion rgba16f (xy: current -> previous, uv units, y down; z: 1 if that previous position
       |          is on screen, i.e. there is a history, else 0)
       v  nr_preprocess.comp
- features f16 [field][16]  ---->  the network (src/)  ---->  head f32 [field][4]
+ features f16 [field][16]  ---->  the network (src/)  ---->  head f16 [field][4]
       |                                                          |
       +---------------------------- nr_composite.comp <----------+
                                           |
@@ -28,7 +29,10 @@ renderer's own resource tracking stays valid because the pass leaves every image
 `SHADER_READ_ONLY_OPTIMAL`.
 
 The demo stores features as f16, moving the original block-0 conversion to the
-preprocess store; F32 graph callers remain supported. Composite writes directly
+preprocess store. It also opts into f16 head storage: the original half
+accumulator bits are retained, then expanded to f32 before composition. The
+composition arithmetic and history truncation are unchanged; default Graph
+callers and CLI head exports remain f32. Composite writes directly
 to the renderer's storage-capable RGBA8 target and independently updates history.
 Unknown or non-storage target usage retains the copy route. See
 [optimization-validation.md](optimization-validation.md) for the integration
@@ -140,6 +144,23 @@ pass does not chain again.
 
 Timestamps follow the same parity: a frame's six stamps are read two frames later, when the GPU is certainly
 done with them, which is why the UI's timings lag by two frames and never stall the queue.
+
+The four secondary command buffers reference **one Graph workspace**, not four
+copies of its allocations. Supported `NrPass` routes reuse whole buffers after
+their final GPU readers; retained encoder skips and block 0 keep their required
+lifetimes. Domain handovers are GPU execution dependencies. Frame entry orders
+counter clearing after earlier readers, and the preceding composite must finish
+reading the head before the next graph execution reuses its storage.
+
+Two queued frames use fixed external image bindings and execute in order on the
+adopted queue. Do not rotate or rebind those images, resize, or destroy the pass
+while commands referring to them are pending. Public Graph allocations and the
+F16 input remain dedicated. The head's bytes are valid through its current-frame
+consumers, not across a subsequent graph execution. Capture and unsupported
+kernel routes keep dedicated storage. `NrPass` defaults to workspace reuse;
+passing `false` as its last constructor argument selects the diagnostic control.
+Other Graph callers must opt in explicitly. See [validation](optimization-validation.md)
+for exact temporal/queued-frame checks and measured memory, distinct from timing.
 
 ## Resolution
 

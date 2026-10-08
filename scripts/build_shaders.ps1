@@ -64,8 +64,8 @@ foreach ($cfg in @(@(512, 4), @(512, 5), @(512, 13), @(256, 5), @(4096, 5), @(10
   python (Join-Path $root "scripts\ptx\gemmv_e4m3.py") $cfg[0] $cfg[1] 1 (Join-Path $ptxOut "gemmv_e4m3_K$($cfg[0])_f$($cfg[1])_s1_m96.ptx") 4 6 0 0 0 96 | Out-Null
   if ($LASTEXITCODE -ne 0) { exit 1 }
 }
-# fused 32-channel block variants: E4 out; E4 + pool; pre + E4 + pool; upres + E4; post + head
-foreach ($f in 2, 66, 74, 330, 130, 48) {
+# fused 32-channel variants: E4 out; E4 + pool; pre (F32/F16) + E4 + pool; upres + E4; post + head (F32/F16)
+foreach ($f in 2, 66, 74, 330, 130, 48, 560) {
   python (Join-Path $root "scripts\ptx\block32_e4m3.py") $f (Join-Path $ptxOut "block32_e4m3_f$f.ptx") | Out-Null
   if ($LASTEXITCODE -ne 0) { exit 1 }
 }

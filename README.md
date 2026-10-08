@@ -141,6 +141,9 @@ only the PTX kernels take part in it.
 
 - `DLSS5VK_UNFUSED=1` runs the GLSL reference route, up to 2560x1440: it materializes every intermediate.
 - `DLSS5VK_PTX_DIR` is the PTX directory, default `build/ptx`.
+- `DLSS5VK_STAGING_MIB` sets each Context's persistent transfer window in MiB, default 16.
+  Accepts integers 1-256; 64 or 256 can help bulk transfers. Larger transfers are chunked.
+  Empty or invalid values fail before Vulkan initialization; unset the variable to restore the default.
 - `DLSS5VK_CHAIN=0` puts barriers between every launch instead of counter chaining.
 - `DLSS5VK_PTX_GEMM`, `GEMMT`, `GEMMV`, `BLOCK32`, `FFN`, `QKV` and `ATTN` set to 0 take one kernel family
   back to its GLSL spelling.

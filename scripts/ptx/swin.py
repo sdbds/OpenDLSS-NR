@@ -428,12 +428,17 @@ class VitExpConsts:
         self.hi = imm(p, "0x3FE93FE9")   # 1.9775390625
 
 
-def vit_norm(p, w):
+def vit_norm(p, w, fused=False):
     """inverseNormVit on 32 halves (16 packed words): r[m] = f16(f32(v[m])^2 + f32(f16(v[m+8]^2))) per component,
     s8/s4/s2 in f16x2, s1 = s2.x + s2.y, f16(rsqrt(f32(s1))) broadcast to a pair."""
     r = []
     for m in range(8):
         hs = hmul2(p, w[m + 8], w[m + 8])
+        if fused:
+            # Native HFMA2 rounds once to half. An intermediate float add can
+            # round a tiny positive square onto a half-way boundary instead.
+            r.append(hfma2(p, w[m], w[m], hs))
+            continue
         lo, hi = unpack16(p, w[m])
         flo = p.reg("f32"); p.emit(f"cvt.f32.f16 {flo}, {lo};")
         fhi = p.reg("f32"); p.emit(f"cvt.f32.f16 {fhi}, {hi};")

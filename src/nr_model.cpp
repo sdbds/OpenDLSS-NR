@@ -1,5 +1,6 @@
 #include "nr_model.h"
 
+#include <algorithm>
 #include <cassert>
 #include <fstream>
 #include <sstream>
@@ -82,8 +83,8 @@ Model::Model(vk::Context& context, const std::string& directory, bool verifyHash
     if (loaded.bytes.size() != (size_t)stage["packedByteLength"].integer())
       throw std::runtime_error("stage size mismatch: " + loaded.id);
     if (verifyHashes) {
-      std::string digest = sha256Hex(loaded.bytes.data(), loaded.bytes.size());
-      if (digest != stage["sha256"].str()) throw std::runtime_error("stage SHA-256 mismatch: " + loaded.id);
+      if (!sha256Matches(loaded.bytes.data(), loaded.bytes.size(), stage["sha256"].str()))
+        throw std::runtime_error("stage SHA-256 mismatch: " + loaded.id);
     }
     stages_.push_back(std::move(loaded));
   }
@@ -102,12 +103,6 @@ Model::Model(vk::Context& context, const std::string& directory, bool verifyHash
     if ((size_t)tensor.stageOffset + tensor.byteLength > stage->bytes.size())
       throw std::runtime_error("tensor exceeds stage " + tensor.name);
     tensor.bytes = stage->bytes.data() + tensor.stageOffset;
-    // Raw bytes on the GPU for per-column aux vectors (padded to 4 bytes).
-    size_t padded = (tensor.byteLength + 3) & ~3u;
-    std::vector<uint8_t> paddedBytes(padded, 0);
-    memcpy(paddedBytes.data(), tensor.bytes, tensor.byteLength);
-    tensor.raw = context_.createBuffer(padded, false, "tensor raw");
-    context_.upload(tensor.raw, paddedBytes.data(), padded);
     tensors_[tensor.name] = std::move(tensor);
   }
   for (uint32_t k = 0; k < 64; ++k) {
@@ -118,7 +113,7 @@ Model::Model(vk::Context& context, const std::string& directory, bool verifyHash
 
 Model::~Model() {
   for (auto& [name, buffer] : matrices_) context_.destroyBuffer(buffer);
-  for (auto& [name, tensor] : tensors_) context_.destroyBuffer(tensor.raw);
+  for (auto& [name, tensor] : tensors_) context_.destroyBuffer(tensor.aux_);
 }
 
 const Tensor& Model::tensor(int block, int layer, const std::string& parameter) const {
@@ -126,6 +121,69 @@ const Tensor& Model::tensor(int block, int layer, const std::string& parameter) 
   auto it = tensors_.find(name);
   if (it == tensors_.end()) throw std::runtime_error("missing tensor " + name);
   return it->second;
+}
+
+const vk::Buffer& Tensor::auxBuffer() const {
+  if (!aux_.buffer) throw std::runtime_error("aux data is not prepared: " + name);
+  return aux_;
+}
+
+uint32_t Tensor::auxOffset(uint32_t byteOffset, uint32_t byteLength) const {
+  if (byteLength) {
+    const uint64_t end = (uint64_t)byteOffset + byteLength;
+    for (const AuxRegion& region : auxRegions_) {
+      if (byteOffset >= region.source.byteOffset &&
+          end <= (uint64_t)region.source.byteOffset + region.source.byteLength)
+        return region.bufferOffset + (byteOffset - region.source.byteOffset);
+    }
+  }
+  throw std::runtime_error("aux read is outside the prepared ranges: " + name + " at " + std::to_string(byteOffset));
+}
+
+void Model::prepareAux(const Tensor& tensor, std::vector<AuxRange> ranges) {
+  auto found = tensors_.find(tensor.name);
+  if (found == tensors_.end() || &found->second != &tensor)
+    throw std::runtime_error("aux tensor is not owned by this model: " + tensor.name);
+  if (ranges.empty()) throw std::runtime_error("empty aux plan: " + tensor.name);
+  std::sort(ranges.begin(), ranges.end(), [](const AuxRange& a, const AuxRange& b) {
+    return a.byteOffset < b.byteOffset;
+  });
+  uint64_t previousEnd = 0;
+  for (const AuxRange& range : ranges) {
+    const uint64_t end = (uint64_t)range.byteOffset + range.byteLength;
+    if (!range.byteLength || end > tensor.byteLength || range.byteOffset < previousEnd)
+      throw std::runtime_error("invalid or overlapping aux range: " + tensor.name);
+    previousEnd = end;
+  }
+  Tensor& target = found->second;
+  if (target.aux_.buffer) {
+    bool same = ranges.size() == target.auxRegions_.size();
+    for (size_t i = 0; same && i < ranges.size(); ++i)
+      same = ranges[i].byteOffset == target.auxRegions_[i].source.byteOffset &&
+             ranges[i].byteLength == target.auxRegions_[i].source.byteLength;
+    if (!same) throw std::runtime_error("cannot change a prepared aux layout: " + tensor.name);
+    return;
+  }
+
+  std::vector<Tensor::AuxRegion> regions;
+  uint64_t packedBytes = 0;
+  for (const AuxRange& range : ranges) {
+    packedBytes = (packedBytes + 15) & ~uint64_t(15);
+    if (packedBytes + range.byteLength > UINT32_MAX)
+      throw std::runtime_error("aux layout exceeds 32-bit offsets: " + tensor.name);
+    regions.push_back({range, (uint32_t)packedBytes});
+    packedBytes += range.byteLength;
+  }
+  packedBytes = (packedBytes + 15) & ~uint64_t(15);
+  if (packedBytes > UINT32_MAX) throw std::runtime_error("aux layout exceeds 32-bit offsets: " + tensor.name);
+  std::vector<uint8_t> packed((size_t)packedBytes, 0);
+  for (const Tensor::AuxRegion& region : regions)
+    memcpy(packed.data() + region.bufferOffset, tensor.bytes + region.source.byteOffset, region.source.byteLength);
+  vk::Buffer buffer = context_.createBuffer(packed.size(), false, "tensor aux", 0, vk::MemoryOwner::Model);
+  try { context_.upload(buffer, packed.data(), packed.size()); }
+  catch (...) { context_.destroyBuffer(buffer); throw; }
+  target.auxRegions_ = std::move(regions);
+  target.aux_ = buffer;
 }
 
 std::vector<uint8_t> Model::fp8MatrixBytes(const Tensor& tensor, uint32_t byteOffset, uint32_t K, uint32_t Nmatrix,
@@ -162,7 +220,7 @@ const vk::Buffer& Model::fp8Matrix(const Tensor& tensor, uint32_t byteOffset, ui
   auto it = matrices_.find(key);
   if (it != matrices_.end()) return it->second;
   std::vector<uint8_t> plain = fp8MatrixBytes(tensor, byteOffset, K, Nmatrix, swizzleK, batchK, tileMajor);
-  vk::Buffer buffer = context_.createBuffer(plain.size(), false, "fp8 weights");
+  vk::Buffer buffer = context_.createBuffer(plain.size(), false, "fp8 weights", 0, vk::MemoryOwner::Model);
   context_.upload(buffer, plain.data(), plain.size());
   return matrices_[key] = buffer;
 }
@@ -175,7 +233,7 @@ const vk::Buffer& Model::fp8MatrixPermuted(const Tensor& tensor, uint32_t byteOf
   if (it != matrices_.end()) return it->second;
   if (columnSource.size() != Nmatrix) throw std::runtime_error("column permutation size mismatch: " + key);
   std::vector<uint8_t> plain = fp8MatrixBytes(tensor, byteOffset, K, Nmatrix, true, batchK, true, &columnSource);
-  vk::Buffer buffer = context_.createBuffer(plain.size(), false, "fp8 weights (permuted)");
+  vk::Buffer buffer = context_.createBuffer(plain.size(), false, "fp8 weights (permuted)", 0, vk::MemoryOwner::Model);
   context_.upload(buffer, plain.data(), plain.size());
   return matrices_[key] = buffer;
 }
@@ -197,7 +255,7 @@ const vk::Buffer& Model::f16Matrix(const Tensor& tensor, uint32_t byteOffset, ui
       plain[(size_t)k * paddedN + n] = (uint16_t)(p[0] | (p[1] << 8));
     }
   }
-  vk::Buffer buffer = context_.createBuffer(plain.size() * 2, false, "f16 weights");
+  vk::Buffer buffer = context_.createBuffer(plain.size() * 2, false, "f16 weights", 0, vk::MemoryOwner::Model);
   context_.upload(buffer, plain.data(), plain.size() * 2);
   return matrices_[key] = buffer;
 }
@@ -226,7 +284,7 @@ const vk::Buffer& Model::relativeBias(const Tensor& tensor, uint32_t relativeByt
       }
     }
   }
-  vk::Buffer buffer = context_.createBuffer(prior.size() * 2, false, "attention prior");
+  vk::Buffer buffer = context_.createBuffer(prior.size() * 2, false, "attention prior", 0, vk::MemoryOwner::Model);
   context_.upload(buffer, prior.data(), prior.size() * 2);
   return matrices_[key] = buffer;
 }

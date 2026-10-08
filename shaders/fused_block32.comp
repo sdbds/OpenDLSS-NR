@@ -44,7 +44,8 @@ const uint F_SKIP_F16 = 1u;    // FFN residual is the f16 skip buffer (else the 
 const uint F_PRE = 8u;         // block 0: f32 input features x f16 adapter (binding 11) -> E4 state and f16 skip in registers
 const uint F_PRE_F16 = 256u;   // F_PRE input already stored as f16, with the same rounding as the F32 conversion
 const uint F_POST = 16u;       // block 70: learned_post_blend of the 2x-upsampled half-res E4 (binding 1) and block-0 E4 (binding 0)
-const uint F_HEAD = 32u;       // block 70: f16 head GEMM (binding 11, [32][16]) -> f32 RGBA (binding 9)
+const uint F_HEAD = 32u;       // block 70: f16 head GEMM (binding 11, [32][16]) -> RGBA (binding 9)
+const uint F_HEAD_F16 = 512u;  // F_HEAD stores the original half bits instead of widening to f32
 const uint F_POOL = 64u;       // 2x2 box pool of the raw f16 output -> E4 half-resolution rows (binding 9)
 const uint F_UPRES = 128u;     // block 66: round_f16(2x-upsampled f16 projection (binding 1) + E4 skip (binding 0) * scale) -> state / skip
 const uint F_OUT_E4 = 2u;      // write the E4 block output
@@ -81,6 +82,7 @@ layout(std430, binding = 7) readonly buffer Prior { float16_t prior[]; };       
 layout(std430, binding = 8) writeonly buffer OutE4 { uvec4 out8x16[]; };         // E4 [tokens][32] as 16-byte words
 layout(std430, binding = 9) writeonly buffer OutF16 { uvec4 out16x8[]; };        // f16 [tokens][32] as 16-byte words
 layout(std430, binding = 9) writeonly buffer OutHead { vec2 head2[]; };          // F_HEAD: f32 [tokens][4] as pairs
+layout(std430, binding = 9) writeonly buffer OutHeadF16 { uint head16Pairs[]; };  // F_HEAD_F16: f16 [tokens][4] as pairs
 layout(std430, binding = 9) writeonly buffer OutPooled { uint pooled32[]; };     // F_POOL: E4 [lowTokens][32] as 4-byte words
 
 
@@ -557,7 +559,7 @@ void main() {
       subgroupBarrier();
     }
     if ((FLAGS & F_HEAD) != 0u) {
-      // RGBA head: [16 tokens][32] f16 x [32][16] f16 in two k16 steps (gemm_f16 order), columns 0..3 as f32.
+      // RGBA head: [16 tokens][32] f16 x [32][16] f16 in two k16 steps (gemm_f16 order), columns 0..3.
       PUBLISH_F16_TILE(result, 32u, tile32, tileBase, g, t)
       subgroupBarrier();
       A16x16H h0; coopMatLoad(h0, tile32, tileBase, 16u, gl_CooperativeMatrixLayoutRowMajor);
@@ -572,8 +574,13 @@ void main() {
         [[unroll]] for (uint h = 0u; h < 2u; ++h) {
           const uint tok = rowBase + g + 8u * h;
           const int x = windowX + int(tok & 7u), y = windowY + int(tok >> 3u);
-          if (slotActive && x >= 0 && y >= 0 && x < int(pc.width) && y < int(pc.height))
-            head2[(uint(y) * pc.width + uint(x)) * 2u + t] = vec2(float(head[4u * h]), float(head[4u * h + 1u]));
+          if (slotActive && x >= 0 && y >= 0 && x < int(pc.width) && y < int(pc.height)) {
+            const uint pair = (uint(y) * pc.width + uint(x)) * 2u + t;
+            if ((FLAGS & F_HEAD_F16) != 0u)
+              head16Pairs[pair] = packFloat2x16(f16vec2(head[4u * h], head[4u * h + 1u]));
+            else
+              head2[pair] = vec2(float(head[4u * h]), float(head[4u * h + 1u]));
+          }
         }
       }
       subgroupBarrier();

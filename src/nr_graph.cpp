@@ -186,7 +186,7 @@ Activation* Graph::allocate(const std::string& label, uint32_t rows, uint32_t ch
   activation->allocRows = alignRows(rows);
   activation->label = label;
   VkDeviceSize bytes = (VkDeviceSize)activation->allocRows * channels * formatBytes(format);
-  activation->buffer = context_.createBuffer(bytes, false, activation->label.c_str());
+  activation->buffer = context_.createBuffer(bytes, false, activation->label.c_str(), 0, vk::MemoryOwner::Graph);
   context_.fillZero(activation->buffer);
   activations_.push_back(std::move(activation));
   allocationsByKey_[key] = activations_.back().get();
@@ -212,9 +212,25 @@ void Graph::capture(VkCommandBuffer commands, const std::string& name, const Act
   Activation* copy = allocate("boundary " + name, source.rows, source.channels, source.format);
   VkBufferCopy region{0, 0, source.validBytes()};
   context_.transferBarrier(commands);
-  vkCmdCopyBuffer(commands, source.buffer.buffer, copy->buffer.buffer, 1, &region);
+  context_.copyBuffer(commands, source.buffer, copy->buffer, region.size);
   context_.transferBarrier(commands);
   boundaries_[name] = copy;
+}
+
+bool Graph::usesPtxExpertFfn(uint32_t channels) const {
+  return options_.fusedBlocks && !options_.captureIntermediates && channels >= 64 && channels <= 256 &&
+         Kernels::ptxFfnEnabled();
+}
+
+void Graph::prepareFusedAux(const Tensor& tensor, const FusedLayout& layout, uint32_t channels) {
+  std::vector<AuxRange> ranges{{layout.ffnCosSkip, channels * 2}, {layout.scale, layout.heads * 4},
+                               {layout.attnCosSkip, channels * 2}};
+  if (layout.transitionScale) ranges.push_back({layout.transitionScale, channels * 2});
+  if (layout.postWeights) {
+    ranges.push_back({layout.inputScale, channels * 2});
+    ranges.push_back({layout.adapterScale, channels * 2});
+  }
+  model_.prepareAux(tensor, std::move(ranges));
 }
 
 Graph::Temporaries Graph::createTemporaries(const std::string& label, uint32_t rows, uint32_t channels) {
@@ -223,29 +239,30 @@ Graph::Temporaries Graph::createTemporaries(const std::string& label, uint32_t r
   uint32_t hidden = layout.expertFfn ? layout.expertCount * 128 : layout.hidden;
   const bool fused = options_.fusedBlocks && !options_.captureIntermediates;
   if (fused && channels == 32) return t;   // the fused 32-channel block keeps everything on chip
-  if (!fused) t.ffn = allocate(label + " FFN", rows, hidden, Format::E4);
-  if (layout.expertFfn) t.ffnNarrow = allocate(label + " FFN narrow", rows, channels, Format::E4);
-  if (!fused) t.ffnResidual = allocate(label + " FFN residual", rows, channels, Format::F16);
-  t.ffnQuantized = allocate(label + " FFN quantized", rows, channels, Format::E4);
+  if (!fused) t.ffn = allocateInternal(label + " FFN", rows, hidden, Format::E4);
+  if (layout.expertFfn && !usesPtxExpertFfn(channels))
+    t.ffnNarrow = allocateInternal(label + " FFN narrow", rows, channels, Format::E4);
+  if (!fused) t.ffnResidual = allocateInternal(label + " FFN residual", rows, channels, Format::F16);
+  t.ffnQuantized = allocateInternal(label + " FFN quantized", rows, channels, Format::E4);
   // c256 (one workgroup per SM) is faster with the separate projection GEMM, hence the default width limit.
-  if (fused && layout.expertFfn && Kernels::ptxFfnEnabled() && channels <= routes_.deferMax)
-    t.ffnQuantized2 = allocate(label + " FFN quantized B", rows, channels, Format::E4);
-  if (!fused) t.qkv = allocate(label + " QKV", rows, channels * 3, Format::F16);
-  if (!fused) t.normalized = allocate(label + " normalized QKV", rows, channels * 3, Format::E4);
-  t.attended = allocate(label + " attended", rows, channels, Format::E4);
+  if (usesPtxExpertFfn(channels) && channels <= routes_.deferMax)
+    t.ffnQuantized2 = allocateInternal(label + " FFN quantized B", rows, channels, Format::E4);
+  if (!fused) t.qkv = allocateInternal(label + " QKV", rows, channels * 3, Format::F16);
+  if (!fused) t.normalized = allocateInternal(label + " normalized QKV", rows, channels * 3, Format::E4);
+  t.attended = allocateInternal(label + " attended", rows, channels, Format::E4);
   return t;
 }
 
 Graph::SplitTemporaries Graph::createSplitTemporaries(const std::string& label, uint32_t rows) {
   SplitTemporaries t;
   const bool fused = options_.fusedBlocks && !options_.captureIntermediates;
-  t.branch = allocate(label + " split branch", rows, 512, Format::E4);
-  if (!fused) t.middle = allocate(label + " split middle", rows, 2048, Format::E4);
-  t.layer0 = allocate(label + " split layer0", rows, 512, Format::E4);
-  t.ffnResidual = allocate(label + " split residual", rows, 512, Format::E4);
-  if (!fused) t.qkv = allocate(label + " split QKV", rows, 1536, Format::F16);
-  if (!fused) t.normalized = allocate(label + " split normalized", rows, 1536, Format::E4);
-  t.attended = allocate(label + " split attended", rows, 512, Format::E4);
+  t.branch = allocateInternal(label + " split branch", rows, 512, Format::E4);
+  if (!fused) t.middle = allocateInternal(label + " split middle", rows, 2048, Format::E4);
+  t.layer0 = allocateInternal(label + " split layer0", rows, 512, Format::E4);
+  t.ffnResidual = allocateInternal(label + " split residual", rows, 512, Format::E4);
+  if (!fused) t.qkv = allocateInternal(label + " split QKV", rows, 1536, Format::F16);
+  if (!fused) t.normalized = allocateInternal(label + " split normalized", rows, 1536, Format::E4);
+  t.attended = allocateInternal(label + " split attended", rows, 512, Format::E4);
   return t;
 }
 
@@ -267,6 +284,7 @@ void Graph::encodeFusedBlock(VkCommandBuffer commands, Temporaries& temps, const
                              uint32_t pooledWidth, bool deferProjection, bool firstInStage, bool lastInStage,
                              uint32_t c32WaitScale, bool c32ChainOut) {
   const uint32_t rows = width * height;
+  prepareFusedAux(tensor, layout, channels);
   // Barrier-free chaining of the expert-stage PTX launches (FFN -> attention -> projection / next FFN).
   const bool chain = routes_.chain && (routes_.chainMask & 1) && layout.expertFfn && channels <= 256;
   uint32_t chainShiftX = 0, chainShiftY = 0;
@@ -314,8 +332,7 @@ void Graph::encodeFusedBlock(VkCommandBuffer commands, Temporaries& temps, const
     const uint32_t experts = layout.expertCount;
     const uint32_t w2Base = layout.expand + experts * channels * 128;
     const uint32_t w3Base = w2Base + experts * 128 * 32;
-    const vk::Buffer& w1Weights = model_.fp8Matrix(tensor, layout.expand, experts * channels, 128, true, channels);
-    if (options_.fusedBlocks && !options_.captureIntermediates && Kernels::ptxFfnEnabled() && channels <= 256) {
+    if (usesPtxExpertFfn(channels)) {
       // PTX expert FFN + W3 in one kernel (ffn_e4m3.py): every expert of a row group in one workgroup.
       if (ffnSkipOverride) throw std::runtime_error("PTX expert FFN assumes the block state is the FFN skip");
       static const std::vector<uint32_t> hiddenPerm = Kernels::mlpHiddenPermutation();
@@ -361,7 +378,8 @@ void Graph::encodeFusedBlock(VkCommandBuffer commands, Temporaries& temps, const
         kernels_.mlpPtx(commands, mlp);
       } else {
         const vk::Buffer& w2Weights = model_.fp8Matrix(tensor, w2Base, experts * 128, 32, true, 128, false);
-        mlp.w1 = &w1Weights; mlp.w2 = &w2Weights;
+        mlp.w1 = &model_.fp8Matrix(tensor, layout.expand, experts * channels, 128, true, channels);
+        mlp.w2 = &w2Weights;
         kernels_.gemmMlp(commands, mlp);
       }
       GemmFp8Args w3;
@@ -374,7 +392,8 @@ void Graph::encodeFusedBlock(VkCommandBuffer commands, Temporaries& temps, const
       const vk::Buffer& w2Weights = model_.fp8Matrix(tensor, w2Base, experts * 128, 32, true, 128);
       GemmFp8Args w1;
       w1.input = &state; w1.rows = rows; w1.K = channels; w1.N = 128; w1.batches = experts; w1.broadcastInput = true;
-      w1.weights = &w1Weights; w1.Nmatrix = 128;
+      w1.weights = &model_.fp8Matrix(tensor, layout.expand, experts * channels, 128, true, channels);
+      w1.Nmatrix = 128;
       w1.output = temps.ffn; w1.silu = true; w1.quantize = true;
       kernels_.gemmFp8(commands, w1);
       GemmFp8Args w2;
@@ -495,6 +514,9 @@ void Graph::encodeSplitBlock(VkCommandBuffer commands, SplitTemporaries& temps, 
   // f32 attention scales; the projection tensor is [512][512] weights then its attention skip scales.
   const uint32_t heads = 16;
   const uint32_t qkvRelative = channels * channels * 3, qkvScale = qkvRelative + heads * 8192;
+  model_.prepareAux(contract, {{channels * channels, channels * 2}});
+  model_.prepareAux(qkvTensor, {{qkvScale, heads * 4}});
+  model_.prepareAux(projection, {{channels * channels, channels * 2}});
 
   GemmFp8Args w1;
   w1.input = &state; w1.rows = rows; w1.K = channels; w1.N = channels;
@@ -584,11 +606,11 @@ void Graph::encodeSplitBlock(VkCommandBuffer commands, SplitTemporaries& temps, 
 void Graph::encodeVit(VkCommandBuffer commands, Activation& state, uint32_t tokens) {
   const uint32_t channels = 1024, heads = 32, ffnChannels = 4096;
   const uint32_t padded = geometry_.paddedVitTokens();
-  Activation* expanded = allocate("ViT FFN 4096", tokens, ffnChannels, Format::E4);
-  Activation* ffnResidual = allocate("ViT FFN residual", tokens, channels, Format::E4);
-  Activation* qkv = allocate("ViT QKV", tokens, channels * 3, Format::F16);
-  Activation* normalized = allocate("ViT normalized QKV", padded, channels * 3, Format::E4);
-  Activation* attended = allocate("ViT attended", tokens, channels, Format::E4);
+  Activation* expanded = allocateInternal("ViT FFN 4096", tokens, ffnChannels, Format::E4);
+  Activation* ffnResidual = allocateInternal("ViT FFN residual", tokens, channels, Format::E4);
+  Activation* qkv = allocateInternal("ViT QKV", tokens, channels * 3, Format::F16);
+  Activation* normalized = allocateInternal("ViT normalized QKV", padded, channels * 3, Format::E4);
+  Activation* attended = allocateInternal("ViT attended", tokens, channels, Format::E4);
   // Counter chaining of the ViT GEMMs (gemmv PTX: one signal per published column group; the consumer waits for
   // the producer's column-group count at kSyncRows + 4 * {0 expand, 1 contract, 2 qkv, 4 projection}).
   const bool chain = routes_.vitChain;
@@ -599,6 +621,9 @@ void Graph::encodeVit(VkCommandBuffer commands, Activation& state, uint32_t toke
     const Tensor& contract = model_.tensor(block, 1);
     const Tensor& qkvTensor = model_.tensor(block, 2);
     const Tensor& projection = model_.tensor(block, 4);
+    model_.prepareAux(contract, {{ffnChannels * channels, channels * 2}});
+    model_.prepareAux(qkvTensor, {{0, heads * 4}});
+    model_.prepareAux(projection, {{channels * channels, channels * 2}});
     GemmFp8Args e;
     e.input = &state; e.rows = tokens; e.K = channels; e.N = ffnChannels;
     e.weights = &model_.fp8Matrix(expand, 0, channels, ffnChannels); e.Nmatrix = ffnChannels;
@@ -670,28 +695,40 @@ void Graph::encodeVit(VkCommandBuffer commands, Activation& state, uint32_t toke
 
 void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
   kernels_.resetDispatchCount();
-  kernels_.resetSync(commands);   // chaining and split-K tile counters
   const Geometry& g = geometry_;
   const uint32_t fullRows = g.fullWidth * g.fullHeight;
   if ((inputFeatures.format != Format::F32 && inputFeatures.format != Format::F16) ||
       inputFeatures.rows != fullRows || inputFeatures.channels != 16)
     throw std::runtime_error("input features must be f16 or f32 [fullWidth*fullHeight][16]");
+  if (!inputFeatures.buffer.buffer || inputFeatures.buffer.size < inputFeatures.validBytes())
+    throw std::runtime_error("input feature buffer is too small");
+  prepareWorkspace();
+  for (const auto& slot : workspaceSlots_)
+    if (inputFeatures.buffer.buffer == slot->buffer.buffer || inputFeatures.buffer.memory == slot->buffer.memory)
+      throw std::runtime_error("borrowed input overlaps the internal workspace");
+  // A subsequent frame's counter clear must wait for earlier compute reads as well.
+  context_.transferBarrier(commands);
+  kernels_.resetSync(commands);   // chaining and split-K tile counters
   boundaries_.clear();
   usedThisRecord_.clear();
   for (uint32_t& phase : windowPhase_) phase = 0;
   usedThisRecord_.insert(inputFeatures.label + "/" + std::to_string(inputFeatures.rows) + "x" + std::to_string(inputFeatures.channels) + "/" + std::to_string((int)inputFeatures.format));
+  workspaceDomain_ = -1;
+  auto enter = [&](WorkspaceDomain domain) { enterWorkspaceDomain(commands, static_cast<uint32_t>(domain)); };
+  enter(WorkspaceDomain::Pre);
 
   // ---- Encoder 32 pre: FP16 input adapter, full-resolution block 0, downsample.
   kernels_.setStageLabel("pre");
   const Tensor& preTensor = model_.tensor(0);
   FusedLayout preLayout = preFusedLayout();
   if (preTensor.byteLength != preLayout.endWithoutPadding + 16) throw std::runtime_error("unexpected block0 layout");
+  prepareFusedAux(preTensor, preLayout, 32);
   const bool fusePre = routes_.fusePre, fusePool = routes_.fusePool;
   const bool preInBlock = options_.fusedBlocks && !options_.captureIntermediates && fusePre;
   const bool poolBlock0 = preInBlock && fusePool;
-  Activation* adapter = allocate("retained full block0", fullRows, 32, Format::E4);
-  Activation* resized = allocate("block0 downsample", g.levels[0].width * g.levels[0].height, 32, Format::E4);
-  Activation* adapterRaw = poolBlock0 ? nullptr : allocate("raw FP16 block0", fullRows, 32, Format::F16);
+  Activation* adapter = allocateInternal("retained full block0", fullRows, 32, Format::E4);
+  Activation* resized = allocateInternal("block0 downsample", g.levels[0].width * g.levels[0].height, 32, Format::E4);
+  Activation* adapterRaw = poolBlock0 ? nullptr : allocateInternal("raw FP16 block0", fullRows, 32, Format::F16);
   Temporaries fullTemps = createTemporaries("pre block0", fullRows, 32);
   if (preInBlock) {
     // The input adapter runs inside block 0; F16 input already has the F32 path's conversion applied.
@@ -725,12 +762,12 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
   } else {
     const Activation* inputHalf = &inputFeatures;
     if (inputFeatures.format == Format::F32) {
-      inputHalf_ = allocate("input features f16", fullRows, 16, Format::F16);
+      inputHalf_ = allocateInternal("input features f16", fullRows, 16, Format::F16);
       kernels_.convertF32ToF16(commands, inputFeatures, *inputHalf_);
       inputHalf = inputHalf_;
     }
-    Activation* projectedFp16 = allocate("full FP16 input adapter", fullRows, 32, Format::F16);
-    Activation* projected = allocate("full FP8 input adapter", fullRows, 32, Format::E4);
+    Activation* projectedFp16 = allocateInternal("full FP16 input adapter", fullRows, 32, Format::F16);
+    Activation* projected = allocateInternal("full FP8 input adapter", fullRows, 32, Format::E4);
     {
       uint32_t paddedN = 0;
       GemmF16Args pre;
@@ -758,13 +795,14 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
     kernels_.downsample2x(commands, *adapterRaw, *resized, g.fullWidth, g.fullHeight, d0.width, d0.height);
   capture(commands, "transition-0-1", *resized);
 
+  enter(WorkspaceDomain::Encoder32);
   Activation* state = resized;
-  Activation* scratch = allocate("encoder 32 state", rows0, 32, Format::E4);
+  Activation* scratch = allocateInternal("encoder 32 state", rows0, 32, Format::E4);
   const bool poolBlock4 = options_.fusedBlocks && !options_.captureIntermediates && fusePool;
-  Activation* transitionRaw32 = poolBlock4 ? nullptr : allocate("raw FP16 block4", rows0, 32, Format::F16);
+  Activation* transitionRaw32 = poolBlock4 ? nullptr : allocateInternal("raw FP16 block4", rows0, 32, Format::F16);
   Temporaries latentTemps = createTemporaries("encoder 32", rows0, 32);
   const uint32_t rows1 = d1.width * d1.height;
-  Activation* downsampled32 = allocate("encoder 32 downsample", rows1, 32, Format::E4);
+  Activation* downsampled32 = allocateInternal("encoder 32 downsample", rows1, 32, Format::E4);
   for (int block = 1; block <= 4; ++block) {
     encodeFusedBlock(commands, latentTemps, *state, scratch, block, 32, d0.width, d0.height, takeWindowPhase(0),
                      fusedLayout(32), model_.tensor(block), nullptr, (block == 4 && !poolBlock4) ? transitionRaw32 : nullptr,
@@ -777,7 +815,8 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
   kernels_.setStageLabel("transition 4-5");
   if (!poolBlock4) kernels_.downsample2x(commands, *transitionRaw32, *downsampled32, d0.width, d0.height, d1.width, d1.height);
   capture(commands, "pooled-4-5", *downsampled32);
-  Activation* next64 = allocate("encoder 64 input", rows1, 64, Format::E4);
+  enter(WorkspaceDomain::ToEncoder64);
+  Activation* next64 = allocateInternal("encoder 64 input", rows1, 64, Format::E4);
   {
     GemmFp8Args t;
     t.input = downsampled32; t.rows = rows1; t.K = 32; t.N = 64;
@@ -794,12 +833,13 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
   Activation* stageInput = next64;
   for (int s = 0; s < 3; ++s) {
     const FusedStage& stage = encoderStages[s];
+    enterWorkspaceDomain(commands, 4 + 2 * s);
     const uint32_t rows = stage.level.width * stage.level.height;
     const uint32_t nextRows = stage.next.width * stage.next.height;
     std::string label = "encoder " + std::to_string(stage.channels);
     Activation* st = stageInput;
-    Activation* sc = allocate(label + " state", rows, stage.channels, Format::E4);
-    Activation* raw = allocate(label + " raw transition", rows, stage.channels, Format::F16);
+    Activation* sc = allocateInternal(label + " state", rows, stage.channels, Format::E4);
+    Activation* raw = allocateInternal(label + " raw transition", rows, stage.channels, Format::F16);
     Temporaries temps = createTemporaries(label, rows, stage.channels);
     const bool deferProj = temps.ffnQuantized2 != nullptr;   // PTX FFN with the projection of the previous block fused
     for (int block = stage.first; block <= stage.last; ++block) {
@@ -811,12 +851,13 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
       if (!hasPendingProjection_) capture(commands, "block-" + std::to_string(block), *st);
     }
     skips[s] = st;
+    enterWorkspaceDomain(commands, 5 + 2 * s);
     kernels_.setStageLabel("transition " + std::to_string(stage.last));
-    Activation* pooled = allocate(label + " downsample", nextRows, stage.channels, Format::E4);
+    Activation* pooled = allocateInternal(label + " downsample", nextRows, stage.channels, Format::E4);
     kernels_.downsample2x(commands, *raw, *pooled, stage.level.width, stage.level.height, stage.next.width,
                           stage.next.height);
     capture(commands, "pooled-" + std::to_string(stage.last) + "-" + std::to_string(stage.last + 1), *pooled);
-    Activation* next = allocate(label + " next stage", nextRows, stage.channels * 2, Format::E4);
+    Activation* next = allocateInternal(label + " next stage", nextRows, stage.channels * 2, Format::E4);
     GemmFp8Args t;
     t.input = pooled; t.rows = nextRows; t.K = stage.channels; t.N = stage.channels * 2;
     t.weights = &model_.fp8Matrix(model_.tensor(stage.last), fusedLayout(stage.channels).endWithoutPadding,
@@ -833,9 +874,10 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
   // ---- Encoder 512 (split blocks 23-30) and the pooled ViT input.
   const uint32_t rows4 = d4.width * d4.height;
   {
+    enter(WorkspaceDomain::Encoder512);
     Activation* st = stageInput;
-    Activation* sc = allocate("encoder 512 state", rows4, 512, Format::E4);
-    Activation* raw = allocate("encoder 512 raw transition", rows4, 512, Format::F16);
+    Activation* sc = allocateInternal("encoder 512 state", rows4, 512, Format::E4);
+    Activation* raw = allocateInternal("encoder 512 raw transition", rows4, 512, Format::F16);
     SplitTemporaries temps = createSplitTemporaries("encoder 512", rows4);
     for (int block = 23; block <= 30; ++block) {
       encodeSplitBlock(commands, temps, *st, sc, block, d4.width, d4.height, takeWindowPhase(4),
@@ -844,11 +886,12 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
       capture(commands, "block-" + std::to_string(block), *st);
     }
     Activation* skip512 = st;
+    enter(WorkspaceDomain::ToVit);
     kernels_.setStageLabel("transition 30-31");
     const uint32_t tokens = g.vitTokens();
-    Activation* pooled = allocate("encoder 512 pooled", tokens, 512, Format::E4);
+    Activation* pooled = allocateInternal("encoder 512 pooled", tokens, 512, Format::E4);
     kernels_.downsample2x(commands, *raw, *pooled, d4.width, d4.height, d5.width, d5.height);
-    Activation* vitState = allocate("ViT state", tokens, 1024, Format::E4);
+    Activation* vitState = allocateInternal("ViT state", tokens, 1024, Format::E4);
     GemmFp8Args t;
     t.input = pooled; t.rows = tokens; t.K = 512; t.N = 1024;
     t.weights = &model_.fp8Matrix(model_.tensor(30, 4), 0, 512, 1024); t.Nmatrix = 1024;
@@ -856,22 +899,27 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
     kernels_.gemmFp8(commands, t);
 
     // ---- ViT 31-38.
+    enter(WorkspaceDomain::Vit);
     encodeVit(commands, *vitState, tokens);
 
     // ---- Decoder 512 (39-47): projected ViT output upsampled onto the encoder skip.
+    enter(WorkspaceDomain::ToDecoder512);
     kernels_.setStageLabel("transition 38-39");
-    Activation* projected512 = allocate("decoder 512 projection", tokens, 512, Format::F16);
+    const Tensor& transition = model_.tensor(39);
+    model_.prepareAux(transition, {{1024 * 512, 512 * 2}});
+    Activation* projected512 = allocateInternal("decoder 512 projection", tokens, 512, Format::F16);
     GemmFp8Args p;
     p.input = vitState; p.rows = tokens; p.K = 1024; p.N = 512; p.partition = 256;
-    p.weights = &model_.fp8Matrix(model_.tensor(39), 0, 1024, 512); p.Nmatrix = 512;
+    p.weights = &model_.fp8Matrix(transition, 0, 1024, 512); p.Nmatrix = 512;
     p.output = projected512; p.quantize = false;
     kernels_.gemmFp8(commands, p);
-    Activation* merged = allocate("decoder 512 skip merge", rows4, 512, Format::E4);
-    kernels_.upsampleResidual(commands, *projected512, *skip512, model_.tensor(39), 1024 * 512, *merged, nullptr,
+    Activation* merged = allocateInternal("decoder 512 skip merge", rows4, 512, Format::E4);
+    kernels_.upsampleResidual(commands, *projected512, *skip512, transition, 1024 * 512, *merged, nullptr,
                               d5.width, d5.height, d4.width, d4.height);
     capture(commands, "block-39", *merged);
+    enter(WorkspaceDomain::Decoder512);
     Activation* dst = merged;
-    Activation* dsc = allocate("decoder 512 state", rows4, 512, Format::E4);
+    Activation* dsc = allocateInternal("decoder 512 state", rows4, 512, Format::E4);
     SplitTemporaries dtemps = createSplitTemporaries("decoder 512", rows4);
     for (int block = 40; block <= 47; ++block) {
       encodeSplitBlock(commands, dtemps, *dst, dsc, block, d4.width, d4.height, takeWindowPhase(4), nullptr,
@@ -887,6 +935,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
   const DecoderStage decoderStages[] = {{d4, d3, 256, 48, 55, 3, skip256}, {d3, d2, 128, 56, 61, 2, skip128},
                                         {d2, d1, 64, 62, 65, 1, skip64}, {d1, d0, 32, 66, 69, 0, skip32}};
   for (const DecoderStage& stage : decoderStages) {
+    enterWorkspaceDomain(commands, 21 - 2 * stage.levelIndex);
     const uint32_t lowRows = stage.low.width * stage.low.height;
     const uint32_t rows = stage.high.width * stage.high.height;
     std::string label = "decoder " + std::to_string(stage.channels);
@@ -895,21 +944,23 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
     FusedLayout layout = upsampleFusedLayout(stage.channels * 2, stage.channels);
     if (transition.byteLength != layout.endWithoutPadding + 16)
       throw std::runtime_error("unexpected upsample layout for block " + std::to_string(stage.first));
-    Activation* projection = allocate(label + " projection", lowRows, stage.channels, Format::F16);
+    prepareFusedAux(transition, layout, stage.channels);
+    Activation* projection = allocateInternal(label + " projection", lowRows, stage.channels, Format::F16);
     GemmFp8Args p;
     p.input = stageInput; p.rows = lowRows; p.K = stage.channels * 2; p.N = stage.channels;
     p.weights = &model_.fp8Matrix(transition, layout.upsampleWeight, stage.channels * 2, stage.channels);
     p.Nmatrix = stage.channels; p.output = projection; p.quantize = false;
     kernels_.gemmFp8(commands, p);
-    Activation* merged = allocate(label + " skip merge", rows, stage.channels, Format::E4);
+    Activation* merged = allocateInternal(label + " skip merge", rows, stage.channels, Format::E4);
     const bool upresInBlock = stage.channels == 32 && options_.fusedBlocks && !options_.captureIntermediates && routes_.fuseUpres;
     Activation* rawMerged = stage.channels == 32 && !upresInBlock
-                                ? allocate(label + " raw skip merge", rows, 32, Format::F16) : nullptr;
+                                ? allocateInternal(label + " raw skip merge", rows, 32, Format::F16) : nullptr;
     if (!upresInBlock)
       kernels_.upsampleResidual(commands, *projection, *stage.skip, transition, layout.transitionScale, *merged,
                                 rawMerged, stage.low.width, stage.low.height, stage.high.width, stage.high.height);
+    enterWorkspaceDomain(commands, 22 - 2 * stage.levelIndex);
     Activation* st = merged;
-    Activation* sc = allocate(label + " state", rows, stage.channels, Format::E4);
+    Activation* sc = allocateInternal(label + " state", rows, stage.channels, Format::E4);
     Temporaries temps = createTemporaries(label, rows, stage.channels);
     for (int block = stage.first; block <= stage.last; ++block) {
       int index = block - stage.first;
@@ -957,11 +1008,13 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
 
   // ---- Full-resolution post block 70 and the RGBA head.
   {
+    enter(WorkspaceDomain::Post);
     const Tensor& tensor = model_.tensor(70);
     kernels_.setStageLabel("post");
     FusedLayout layout = postFusedLayout();
     if (tensor.byteLength != layout.endWithoutPadding) throw std::runtime_error("unexpected block70 layout");
-    head_ = allocate("RGBA neural head", fullRows, 4, Format::F32);
+    prepareFusedAux(tensor, layout, 32);
+    head_ = allocateInternal("RGBA neural head", fullRows, 4, options_.fp16Head ? Format::F16 : Format::F32);
     if (options_.fusedBlocks && !options_.captureIntermediates && routes_.fusePost) {
       // The post blend (2x upsample of block 69 + block 0, learned scales) feeds block 70 in registers and the
       // RGBA head runs in its epilogue: the frame's last full-resolution round trips disappear.
@@ -992,11 +1045,11 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
       chainBlock32(f, 70, 2, false);
       kernels_.fusedBlock32(commands, f);
     } else {
-      Activation* rawMerged = allocate("post raw merge", fullRows, 32, Format::F16);
-      Activation* merged = allocate("post merge", fullRows, 32, Format::E4);
+      Activation* rawMerged = allocateInternal("post raw merge", fullRows, 32, Format::F16);
+      Activation* merged = allocateInternal("post merge", fullRows, 32, Format::E4);
       kernels_.postBlend(commands, *stageInput, *adapter, tensor, layout.inputScale, layout.adapterScale, *rawMerged,
                          *merged, d0.width, d0.height, g.fullWidth, g.fullHeight);
-      Activation* rawBlockOutput = allocate("post raw block output", fullRows, 32, Format::F16);
+      Activation* rawBlockOutput = allocateInternal("post raw block output", fullRows, 32, Format::F16);
       Temporaries temps = createTemporaries("post", fullRows, 32);
       encodeFusedBlock(commands, temps, *merged, nullptr, 70, 32, g.fullWidth, g.fullHeight,
                        takeWindowPhase(kFullLevel), layout, tensor, rawMerged, rawBlockOutput);
@@ -1009,6 +1062,9 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
       kernels_.gemmF16(commands, post);
     }
   }
+  if (workspaceActive_)
+    for (const auto& request : workspaceRequests_)
+      if (!usedThisRecord_.contains(request.key)) throw std::runtime_error("unused planned workspace view " + request.key);
   kernels_.checkChainOrder();
 }
 

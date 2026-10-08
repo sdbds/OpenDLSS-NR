@@ -1,16 +1,32 @@
 #include "vk_context.h"
+#include "compute_trace.h"
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
+#include <limits>
+#include <sstream>
 
 namespace vk {
 
 namespace {
-constexpr VkDeviceSize kStagingBytes = 256ull << 20;  // 256 MiB staging window
+constexpr VkDeviceSize kStagingBytes = 16ull << 20;  // Large transfers use the existing chunked path.
 constexpr const char* kValidationLayer = "VK_LAYER_KHRONOS_validation";
 std::atomic<uint32_t> g_validationErrors{0};
+
+VkDeviceSize stagingBytesFromEnvironment() {
+  const char* value = getenv("DLSS5VK_STAGING_MIB");
+  if (!value) return kStagingBytes;
+  uint32_t mib = 0;
+  const char* end = value + strlen(value);
+  const auto parsed = std::from_chars(value, end, mib);
+  if (parsed.ec != std::errc{} || parsed.ptr != end || mib < 1 || mib > 256)
+    throw std::runtime_error("DLSS5VK_STAGING_MIB must be an integer from 1 to 256");
+  return VkDeviceSize(mib) << 20;
+}
 
 bool envFlag(const char* name) {
   const char* value = getenv(name);
@@ -29,6 +45,7 @@ VkBool32 VKAPI_PTR onDebugMessage(VkDebugUtilsMessageSeverityFlagBitsEXT severit
 uint32_t Context::validationErrors() { return g_validationErrors.load(); }
 
 Context::Context() {
+  const VkDeviceSize stagingBytes = stagingBytesFromEnvironment();
   if (volkInitialize() != VK_SUCCESS) throw std::runtime_error("vulkan-1.dll unavailable");
 
   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -159,10 +176,11 @@ Context::Context() {
   deviceInfo.ppEnabledExtensionNames = req.extensions.data();
   VK_CHECK(vkCreateDevice(physical_, &deviceInfo, nullptr, &device_));
   volkLoadDevice(device_);
-  initCommon();
+  initCommon(stagingBytes);
 }
 
 Context::Context(VkInstance instance, VkPhysicalDevice physical, VkDevice device, uint32_t queueFamily, uint32_t queueIndex) {
+  const VkDeviceSize stagingBytes = stagingBytesFromEnvironment();
   if (volkInitialize() != VK_SUCCESS) throw std::runtime_error("vulkan-1.dll unavailable");
   instance_ = instance; physical_ = physical; device_ = device; queueFamily_ = queueFamily; queueIndex_ = queueIndex; owned_ = false;
   volkLoadInstance(instance_);
@@ -178,7 +196,7 @@ Context::Context(VkInstance instance, VkPhysicalDevice physical, VkDevice device
   timestampPeriod_ = properties.properties.limits.timestampPeriod;
   maxSharedMemory_ = properties.properties.limits.maxComputeSharedMemorySize;
   vkGetPhysicalDeviceMemoryProperties(physical_, &memoryProperties_);
-  initCommon();
+  initCommon(stagingBytes);
 }
 
 DeviceRequirements::DeviceRequirements() {
@@ -237,7 +255,7 @@ DeviceRequirements::DeviceRequirements() {
                               VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME};
 }
 
-void Context::initCommon() {
+void Context::initCommon(VkDeviceSize stagingBytes) {
   vkGetDeviceQueue(device_, queueFamily_, queueIndex_, &queue_);
 
   VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -270,9 +288,9 @@ void Context::initCommon() {
   for (VkDescriptorPool& pool : descriptorPools_) VK_CHECK(vkCreateDescriptorPool(device_, &descriptorPoolInfo, nullptr, &pool));
   descriptorPool_ = descriptorPools_[0];
 
-  dummy_ = createBuffer(256, false, "dummy binding");
+  dummy_ = createBuffer(256, false, "dummy binding", 0, MemoryOwner::Context);
   fillZero(dummy_);
-  staging_ = createBuffer(kStagingBytes, true, "staging");
+  staging_ = createBuffer(stagingBytes, true, "staging", 0, MemoryOwner::Context);
 }
 
 Context::~Context() {
@@ -301,7 +319,92 @@ uint32_t Context::findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags requir
   throw std::runtime_error("no suitable memory type");
 }
 
-Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* label, VkBufferUsageFlags extra) {
+void Context::trackAllocation(VkDeviceMemory memory, VkDeviceSize logicalBytes, VkDeviceSize allocatedBytes,
+                               uint32_t memoryType, MemoryOwner owner, MemoryKind kind, const char* label) {
+  const size_t ownerIndex = static_cast<size_t>(owner);
+  if (!memory || !allocatedBytes || memoryType >= memoryProperties_.memoryTypeCount ||
+      ownerIndex >= memoryStats_.owners.size() || allocations_.count(memory))
+    throw std::runtime_error("invalid or duplicate memory allocation record");
+  const uint32_t heap = memoryProperties_.memoryTypes[memoryType].heapIndex;
+  MemoryCounters* counters[] = {&memoryStats_, &memoryStats_.heaps[heap], &memoryStats_.owners[ownerIndex]};
+  for (const auto* counter : counters) {
+    if (allocatedBytes > std::numeric_limits<VkDeviceSize>::max() - counter->liveBytes ||
+        logicalBytes > std::numeric_limits<VkDeviceSize>::max() - counter->liveLogicalBytes)
+      throw std::runtime_error("memory accounting overflow");
+  }
+  allocations_.emplace(memory, MemoryRecord{memory, logicalBytes, allocatedBytes, memoryType, heap,
+                        memoryProperties_.memoryTypes[memoryType].propertyFlags, owner, kind, label ? label : ""});
+  for (auto* counter : counters) {
+    counter->liveBytes += allocatedBytes;
+    counter->liveLogicalBytes += logicalBytes;
+    counter->peakBytes = std::max(counter->peakBytes, counter->liveBytes);
+    ++counter->allocationCount;
+  }
+}
+
+void Context::untrackAllocation(VkDeviceMemory memory, MemoryKind kind) {
+  auto entry = allocations_.find(memory);
+  if (entry == allocations_.end() || entry->second.kind != kind)
+    throw std::runtime_error("unknown allocation or mismatched memory kind");
+  const auto& record = entry->second;
+  for (auto* counter : {static_cast<MemoryCounters*>(&memoryStats_), &memoryStats_.heaps[record.heap],
+                         &memoryStats_.owners[static_cast<size_t>(record.owner)]}) {
+    counter->liveBytes -= record.allocatedBytes;
+    counter->liveLogicalBytes -= record.logicalBytes;
+    ++counter->freeCount;
+  }
+  allocations_.erase(entry);
+}
+
+void Context::trackImageAllocation(VkDeviceMemory memory, VkDeviceSize logicalBytes, VkDeviceSize allocatedBytes,
+                                    uint32_t memoryType, const char* label) {
+  trackAllocation(memory, logicalBytes, allocatedBytes, memoryType, MemoryOwner::Pass, MemoryKind::Image, label);
+}
+
+void Context::untrackImageAllocation(VkDeviceMemory memory) { untrackAllocation(memory, MemoryKind::Image); }
+
+MemorySnapshot Context::memorySnapshot() const {
+  MemorySnapshot snapshot = memoryStats_;
+  snapshot.heapCount = memoryProperties_.memoryHeapCount;
+  for (uint32_t heap = 0; heap < snapshot.heapCount; ++heap)
+    snapshot.heapFlags[heap] = memoryProperties_.memoryHeaps[heap].flags;
+  snapshot.records.reserve(allocations_.size());
+  for (const auto& [memory, record] : allocations_) snapshot.records.push_back(record);
+  return snapshot;
+}
+
+std::string MemorySnapshot::report(const char* phase, bool includeRecords) const {
+  static const char* ownerNames[] = {"context", "model", "kernels", "graph", "pass", "unspecified"};
+  std::ostringstream out;
+  auto totals = [&](const MemoryCounters& counters) {
+    out << " allocated_bytes=" << counters.liveBytes << " logical_bytes=" << counters.liveLogicalBytes
+        << " peak_bytes=" << counters.peakBytes << " allocate_calls=" << counters.allocationCount
+        << " free_calls=" << counters.freeCount << '\n';
+  };
+  out << "owned_memory phase=" << phase << " scope=context-and-clients live_allocations=" << records.size();
+  totals(*this);
+  for (uint32_t heap = 0; heap < heapCount; ++heap) {
+    out << "owned_heap phase=" << phase << " heap=" << heap << " flags=" << heapFlags[heap];
+    totals(heaps[heap]);
+  }
+  for (size_t owner = 0; owner < owners.size(); ++owner) {
+    if (!owners[owner].allocationCount) continue;
+    out << "owned_category phase=" << phase << " owner=" << ownerNames[owner];
+    totals(owners[owner]);
+  }
+  if (includeRecords) for (const auto& record : records) {
+    out << "owned_allocation phase=" << phase << " owner=" << ownerNames[static_cast<size_t>(record.owner)]
+        << " kind=" << (record.kind == MemoryKind::Buffer ? "buffer" : "image") << " heap=" << record.heap
+        << " memory_type=" << record.memoryType << " properties=" << record.properties
+        << " allocated_bytes=" << record.allocatedBytes << " logical_bytes=" << record.logicalBytes
+        << " label=" << std::quoted(record.label) << '\n';
+  }
+  return out.str();
+}
+
+Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* label, VkBufferUsageFlags extra,
+                             MemoryOwner owner) {
+  if (static_cast<size_t>(owner) >= memoryStats_.owners.size()) throw std::runtime_error("invalid memory owner");
   Buffer result;
   result.size = std::max<VkDeviceSize>(size, 16);
   result.hostVisible = hostVisible;
@@ -312,24 +415,39 @@ Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* la
                VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | extra;
   info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   VK_CHECK(vkCreateBuffer(device_, &info, nullptr, &result.buffer));
-  VkMemoryRequirements requirements;
-  vkGetBufferMemoryRequirements(device_, result.buffer, &requirements);
-  VkMemoryAllocateFlagsInfo allocateFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
-  allocateFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-  VkMemoryAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-  allocateInfo.pNext = &allocateFlags;
-  allocateInfo.allocationSize = requirements.size;
-  allocateInfo.memoryTypeIndex = findMemoryType(
-      requirements.memoryTypeBits,
-      hostVisible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-                  : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-  VK_CHECK(vkAllocateMemory(device_, &allocateInfo, nullptr, &result.memory));
-  VK_CHECK(vkBindBufferMemory(device_, result.buffer, result.memory, 0));
-  if (hostVisible) VK_CHECK(vkMapMemory(device_, result.memory, 0, VK_WHOLE_SIZE, 0, &result.mapped));
-  return result;
+  bool tracked = false;
+  try {
+    VkMemoryRequirements requirements;
+    vkGetBufferMemoryRequirements(device_, result.buffer, &requirements);
+    VkMemoryAllocateFlagsInfo allocateFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    allocateFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocateInfo.pNext = &allocateFlags;
+    allocateInfo.allocationSize = requirements.size;
+    allocateInfo.memoryTypeIndex = findMemoryType(
+        requirements.memoryTypeBits,
+        hostVisible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                    : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK_CHECK(vkAllocateMemory(device_, &allocateInfo, nullptr, &result.memory));
+    trackAllocation(result.memory, size, requirements.size, allocateInfo.memoryTypeIndex, owner, MemoryKind::Buffer, label);
+    tracked = true;
+    VK_CHECK(vkBindBufferMemory(device_, result.buffer, result.memory, 0));
+    if (hostVisible) VK_CHECK(vkMapMemory(device_, result.memory, 0, VK_WHOLE_SIZE, 0, &result.mapped));
+    if (trace_) trace_->bufferCreated(result, deviceAddress(result));
+    return result;
+  } catch (...) {
+    if (trace_) trace_->bufferDestroyed(result);
+    if (result.mapped) vkUnmapMemory(device_, result.memory);
+    vkDestroyBuffer(device_, result.buffer, nullptr);
+    if (result.memory) vkFreeMemory(device_, result.memory, nullptr);
+    if (tracked) untrackAllocation(result.memory, MemoryKind::Buffer);
+    throw;
+  }
 }
 
 void Context::destroyBuffer(Buffer& buffer) {
+  if (buffer.memory) untrackAllocation(buffer.memory, MemoryKind::Buffer);
+  if (trace_) trace_->bufferDestroyed(buffer);
   if (buffer.mapped) vkUnmapMemory(device_, buffer.memory);
   if (buffer.buffer) vkDestroyBuffer(device_, buffer.buffer, nullptr);
   if (buffer.memory) vkFreeMemory(device_, buffer.memory, nullptr);
@@ -338,6 +456,7 @@ void Context::destroyBuffer(Buffer& buffer) {
 
 void Context::upload(const Buffer& target, const void* data, VkDeviceSize size, VkDeviceSize offset) {
   if (offset + size > target.size) throw std::runtime_error(std::string("upload overflows ") + target.label);
+  if (trace_) trace_->upload(target, data, size, offset);
   const uint8_t* bytes = static_cast<const uint8_t*>(data);
   VkDeviceSize done = 0;
   while (done < size) {
@@ -352,9 +471,21 @@ void Context::upload(const Buffer& target, const void* data, VkDeviceSize size, 
 }
 
 void Context::fillZero(const Buffer& target) {
+  if (trace_) trace_->zero(target);
   VkCommandBuffer commands = beginCommands();
   vkCmdFillBuffer(commands, target.buffer, 0, VK_WHOLE_SIZE, 0);
   endAndSubmit(commands, true);
+}
+
+void Context::clearBuffer(VkCommandBuffer commands, const Buffer& target, uint32_t value) {
+  if (trace_) trace_->clear(commands, target, value);
+  vkCmdFillBuffer(commands, target.buffer, 0, VK_WHOLE_SIZE, value);
+}
+
+void Context::copyBuffer(VkCommandBuffer commands, const Buffer& source, const Buffer& destination, VkDeviceSize bytes) {
+  if (trace_) trace_->copy(commands, source, destination, bytes);
+  VkBufferCopy region{0, 0, bytes};
+  vkCmdCopyBuffer(commands, source.buffer, destination.buffer, 1, &region);
 }
 
 std::vector<uint8_t> Context::download(const Buffer& source, VkDeviceSize size, VkDeviceSize offset) {
@@ -414,6 +545,7 @@ Pipeline Context::createComputePipeline(VkShaderModule module, const SpecConstan
   Pipeline result;
   result.label = label;
   VK_CHECK(vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &result.pipeline));
+  if (trace_) trace_->pipelineCreated(result.pipeline, label, constants);
   return result;
 }
 
@@ -534,6 +666,7 @@ void Context::endAndSubmit(VkCommandBuffer commands, bool wait) {
 }
 
 void Context::computeBarrier(VkCommandBuffer commands) {
+  if (trace_) trace_->barrier(commands);
   // Compute -> compute only. Including the transfer stages here made NVIDIA flush
   // caches between every dispatch (tens of microseconds per barrier once L2 is dirty).
   VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -549,6 +682,7 @@ void Context::computeBarrier(VkCommandBuffer commands) {
 
 // Captures and uploads only.
 void Context::transferBarrier(VkCommandBuffer commands) {
+  if (trace_) trace_->barrier(commands);
   VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
   barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
   barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -596,6 +730,7 @@ VkCudaModuleNV Context::createCudaModule(const std::string& ptx) {
   info.pData = ptx.c_str();
   VkCudaModuleNV module = VK_NULL_HANDLE;
   VK_CHECK(vkCreateCudaModuleNV(device_, &info, nullptr, &module));
+  if (trace_) trace_->moduleCreated(module, ptx);
   return module;
 }
 
@@ -605,6 +740,7 @@ VkCudaFunctionNV Context::createCudaFunction(VkCudaModuleNV module, const char* 
   info.pName = name;
   VkCudaFunctionNV function = VK_NULL_HANDLE;
   VK_CHECK(vkCreateCudaFunctionNV(device_, &info, nullptr, &function));
+  if (trace_) trace_->functionCreated(function, module, name);
   return function;
 }
 
@@ -618,6 +754,7 @@ void Context::destroyCudaModule(VkCudaModuleNV module) {
 
 void Context::cudaLaunch(VkCommandBuffer commands, VkCudaFunctionNV function, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
                          uint32_t blockX, uint32_t sharedBytes, const void* const* params, size_t paramCount) {
+  if (trace_) trace_->launch(commands, function, gridX, gridY, gridZ, blockX, sharedBytes, params, paramCount);
   VkCudaLaunchInfoNV info{VK_STRUCTURE_TYPE_CUDA_LAUNCH_INFO_NV};
   info.function = function;
   info.gridDimX = gridX; info.gridDimY = gridY; info.gridDimZ = gridZ;

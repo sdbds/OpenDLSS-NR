@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <type_traits>
 
 namespace {
 void require(bool condition, const std::string& message) {
@@ -21,6 +22,13 @@ std::string value(int argc, char** argv, const std::string& key, const std::stri
 bool flag(int argc, char** argv, const std::string& key) {
   for (int i = 1; i < argc; ++i) if (key == argv[i]) return true;
   return false;
+}
+template<class Pass>
+void requireDefaultWorkspace(const Pass& pass, bool requested) {
+  if (!requested) return;
+  if constexpr (requires { pass.workspaceReport(); })
+    require(pass.workspaceReport().find("route=reuse") != std::string::npos, "default NrPass did not enable workspace reuse");
+  else throw std::runtime_error("NrPass workspace reporting is unavailable");
 }
 std::vector<uint8_t> read(const std::filesystem::path& path) {
   std::ifstream in(path, std::ios::binary | std::ios::ate);
@@ -184,6 +192,14 @@ class HistoryReader {
   }
   std::vector<uint8_t> read(VkImageView view, uint32_t width, uint32_t height) {
     auto result = context_.createBuffer((VkDeviceSize)width * height * 8, false, "test history readback");
+    auto commands = context_.beginCommands();
+    record(commands, view, width, height, result);
+    context_.endAndSubmit(commands, true);
+    auto bytes = context_.download(result, result.size);
+    context_.destroyBuffer(result);
+    return bytes;
+  }
+  void record(VkCommandBuffer commands, VkImageView view, uint32_t width, uint32_t height, const vk::Buffer& result) {
     VkDescriptorImageInfo image{sampler_, view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo buffer{result.buffer, 0, result.size};
     VkWriteDescriptorSet writes[2]{};
@@ -194,7 +210,6 @@ class HistoryReader {
     writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; writes[0].pImageInfo = &image;
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[1].pBufferInfo = &buffer;
     vkUpdateDescriptorSets(context_.device(), 2, writes, 0, nullptr);
-    auto commands = context_.beginCommands();
     VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     memory.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; memory.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -204,10 +219,6 @@ class HistoryReader {
     vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &set_, 0, nullptr);
     vkCmdPushConstants(commands, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(size), size);
     vkCmdDispatch(commands, (width + 7) / 8, (height + 7) / 8, 1);
-    context_.endAndSubmit(commands, true);
-    auto bytes = context_.download(result, result.size);
-    context_.destroyBuffer(result);
-    return bytes;
   }
  private:
   vk::Context& context_;
@@ -218,10 +229,151 @@ class HistoryReader {
   VkDescriptorSet set_{};
   VkSampler sampler_{};
 };
+
+struct PassSnapshot {
+  std::vector<uint8_t> output, history0, history1;
+  bool operator==(const PassSnapshot&) const = default;
+};
+struct ReadbackBuffers {
+  vk::Context& context;
+  std::vector<vk::Buffer> buffers;
+  ~ReadbackBuffers() { for (auto& buffer : buffers) context.destroyBuffer(buffer); }
+};
+struct QueuedCommands {
+  vk::Context& context;
+  VkCommandPool pool{};
+  std::array<VkCommandBuffer, 2> buffers{};
+  explicit QueuedCommands(vk::Context& c) : context(c) {
+    VkCommandPoolCreateInfo info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; info.queueFamilyIndex = context.queueFamily();
+    VK_CHECK(vkCreateCommandPool(context.device(), &info, nullptr, &pool));
+    VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocate.commandPool = pool; allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; allocate.commandBufferCount = 2;
+    VK_CHECK(vkAllocateCommandBuffers(context.device(), &allocate, buffers.data()));
+  }
+  ~QueuedCommands() { vkDestroyCommandPool(context.device(), pool, nullptr); }
+};
+
+template<class Pass>
+void workspacePass(int argc, char** argv) {
+  if constexpr (!std::is_constructible_v<Pass, const GpuDevice&, uint32_t, uint32_t,
+                const std::string&, const std::string&, const std::string&, bool>) {
+    throw std::runtime_error("NrPass workspace selection is unavailable");
+  } else {
+    const uint32_t width = std::stoul(value(argc, argv, "--width", "193"));
+    const uint32_t height = std::stoul(value(argc, argv, "--height", "129"));
+    const bool storage = !flag(argc, argv, "--copy-target");
+    vk::Context context;
+    GpuDevice gpu{(void*)context.instance(), (void*)context.physical(), (void*)context.device(), context.queueFamily(), 0, 0};
+    Image color(context, width, height, VK_FORMAT_R16G16B16A16_SFLOAT);
+    Image velocity(context, width, height, VK_FORMAT_R32G32B32A32_UINT);
+    Image output(context, width, height, VK_FORMAT_R8G8B8A8_UNORM, storage);
+    std::vector<uint16_t> scene(size_t(width) * height * 4);
+    std::vector<uint32_t> motion(scene.size(), 0);
+    for (uint32_t y = 0; y < height; ++y) for (uint32_t x = 0; x < width; ++x) {
+      const size_t p = (size_t(y) * width + x) * 4;
+      scene[p] = num::f16Bits(float(x) / width * 3.0f);
+      scene[p + 1] = num::f16Bits(float(y) / height);
+      scene[p + 2] = num::f16Bits(((x / 13 + y / 7) % 2) ? 0.125f : 1.125f);
+      scene[p + 3] = num::f16Bits(1.0f);
+      motion[p] = 1; motion[p + 1] = num::f32Bits(0.5f);
+      motion[p + 2] = num::f32Bits(2.0f / width); motion[p + 3] = num::f32Bits(-1.0f / height);
+    }
+    color.upload(scene.data(), scene.size() * 2);
+    velocity.upload(motion.data(), motion.size() * 4);
+    updateSets = vkUpdateDescriptorSets; vkUpdateDescriptorSets = observeSets;
+    createView = vkCreateImageView; vkCreateImageView = observeCreateView;
+    destroyView = vkDestroyImageView; vkDestroyImageView = observeDestroyView;
+    struct RestoreHooks {
+      ~RestoreHooks() {
+        vkUpdateDescriptorSets = updateSets;
+        vkCreateImageView = createView; vkDestroyImageView = destroyView;
+      }
+    } restoreHooks;
+    auto run = [&](bool reuse, bool resetEvery, bool queued) {
+      setUpdates = 0;
+      Pass pass(gpu, width, height, "models/nr", "build/shaders", "build/tests/demo-shaders", reuse);
+      // Adopting the device reloads Volk's globals; observe the newly loaded table.
+      vkUpdateDescriptorSets = observeSets;
+      vkCreateImageView = observeCreateView; vkDestroyImageView = observeDestroyView;
+      std::array<std::unique_ptr<HistoryReader>, 4> readers;
+      for (auto& reader : readers) reader = std::make_unique<HistoryReader>(context);
+      ReadbackBuffers readbacks{context};
+      QueuedCommands primary(context);
+      for (int frame = 0; frame < 2; ++frame) for (uint32_t bytes : {4u, 8u, 8u})
+        readbacks.buffers.push_back(context.createBuffer(uint64_t(width) * height * bytes, false, "queued pass readback"));
+      std::vector<PassSnapshot> snapshots;
+      const float background[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+      NrControls controls;
+      controls.localTone = 0.75013f; controls.localStructure = 0.3517f;
+      vk::MemorySnapshot stable;
+      for (int base = 0; base < 6; base += queued ? 2 : 1) {
+        const int count = queued ? 2 : 1;
+        std::array<VkCommandBuffer, 2> commands{};
+        for (int index = 0; index < count; ++index) {
+          if (resetEvery || base + index == 0) pass.resetHistory();
+          const auto frame = pass.beginFrame(controls, background);
+          commands[index] = primary.buffers[index];
+          VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+          begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+          VK_CHECK(vkBeginCommandBuffer(commands[index], &begin));
+          pass.recordStamp(commands[index], frame, NrPass::kFrameStart);
+          pass.record(commands[index], frame, color.info, velocity.info, output.info);
+          pass.recordStamp(commands[index], frame, NrPass::kPresentEnd);
+          output.info.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+          require(setUpdates == 4, "fixed-image queued frames descriptor updates=" + std::to_string(setUpdates) +
+                                      " frame=" + std::to_string(base + index));
+          barrier(commands[index], output.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+          VkBufferImageCopy copy{};
+          copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; copy.imageExtent = {width, height, 1};
+          vkCmdCopyImageToBuffer(commands[index], output.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                 readbacks.buffers[index * 3].buffer, 1, &copy);
+          barrier(commands[index], output.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+          for (int parity = 0; parity < 2; ++parity)
+            readers[index * 2 + parity]->record(commands[index], histories[parity], width, height,
+                                                readbacks.buffers[index * 3 + 1 + parity]);
+          pass.endFrame();
+        }
+        // Both parities are pre-recorded with fixed images before either is submitted.
+        for (int index = 0; index < count; ++index) context.endAndSubmit(commands[index], false);
+        context.waitIdle();
+        require(!pass.chainTimedOut(), "queued workspace chain timed out");
+        for (int index = 0; index < count; ++index) {
+          auto download = [&](int offset) {
+            const auto& buffer = readbacks.buffers[index * 3 + offset];
+            return context.download(buffer, buffer.size);
+          };
+          snapshots.push_back({download(0), download(1), download(2)});
+        }
+        const auto now = pass.context().memorySnapshot();
+        if (base == 0) stable = now;
+        else require(now.allocationCount == stable.allocationCount && now.freeCount == stable.freeCount &&
+                     now.liveBytes == stable.liveBytes, "NrPass steady execution changed owned allocations");
+      }
+      const auto& graph = stable.owners[static_cast<size_t>(vk::MemoryOwner::Graph)];
+      std::cout << "pass workspace=" << (reuse ? "reuse" : "dedicated") << " reset=" << (resetEvery ? "every" : "first")
+                << " queued=" << queued << " graph_bytes=" << graph.liveBytes << '\n';
+      return std::make_pair(std::move(snapshots), graph.liveBytes);
+    };
+    for (bool resetEvery : {false, true}) {
+      const auto dedicated = run(false, resetEvery, false);
+      const auto reused = run(true, resetEvery, false);
+      require(dedicated.first == reused.first, "NrPass dedicated/reuse output or history mismatch");
+      require(reused.second < dedicated.second, "NrPass did not select the reuse route");
+      const auto queuedDedicated = run(false, resetEvery, true);
+      const auto queuedReused = run(true, resetEvery, true);
+      require(queuedDedicated.first == dedicated.first, "queued dedicated frames differ from serialized reference");
+      require(queuedReused.first == dedicated.first, "two_pre_recorded_frames_preserve_composite_reads failed");
+    }
+    require(vk::Context::validationErrors() == 0, "Vulkan validation reported errors");
+    std::cout << "PASS NrPass A/B output, both history parities, reset every/first, and two queued frames\n";
+  }
+}
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
+    if (flag(argc, argv, "--workspace-check")) { workspacePass<NrPass>(argc, argv); return 0; }
     const std::filesystem::path reference = value(argc, argv, "--reference", "tmp/optimization/pass-baseline");
     const bool record = flag(argc, argv, "--record");
     const bool direct = flag(argc, argv, "--expect-direct");
@@ -243,6 +395,7 @@ int main(int argc, char** argv) {
     auto output = std::make_unique<Image>(context, width, height, VK_FORMAT_R8G8B8A8_UNORM, storage);
     auto alternate = std::make_unique<Image>(context, width, height, VK_FORMAT_R8G8B8A8_UNORM, storage && !mixed);
     NrPass pass(gpu, width, height, "models/nr", "build/shaders", "build/tests/demo-shaders");
+    requireDefaultWorkspace(pass, flag(argc, argv, "--expect-workspace-default"));
     updateSets = vkUpdateDescriptorSets; vkUpdateDescriptorSets = observeSets;
     copyImage = vkCmdCopyImage; vkCmdCopyImage = observeCopy;
     createView = vkCreateImageView; vkCreateImageView = observeCreateView;
